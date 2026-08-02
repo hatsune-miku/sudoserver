@@ -1,10 +1,37 @@
 # SudoServer
 
-SudoServer 是一个由用户控制的本机提权代理：用户用 Master Password 或 Authenticator 动态码签发短期 JWT，Agent 再用 JWT 建立真实、持久化的管理员/root PowerShell 会话。服务同时提供 JSON HTTP API、MCP Streamable HTTP 端点和本地管理页面。
+> 让 AI 在确实需要时，方便、安全地执行管理员/root PowerShell，而不用和 Agent 沙箱反复斗智斗勇。
 
-> 这是一个有意提供任意管理员/root 命令执行能力的安全敏感组件。请先阅读 [安全模型](#安全模型与已知边界)，不要把端口暴露到网络。
+SudoServer 是主要面向 AI Agent 的本机提权通道。当必要的系统操作被 Agent 沙箱、权限限制或提权边界拦住时，Agent 可以通过 MCP 请求一段由用户明确授权的高权限会话，直接完成安装软件、修改系统配置、管理服务等工作。
 
-## 当前实现
+它不是让 AI 擅自“逃出沙箱”，而是把越过权限边界这件事变成一个清楚的用户决策：用户亲自签发 JWT，Agent 只能凭该 JWT 建立会话；令牌和会话都可以随时撤销，服务重启后此前令牌自然失效。
+
+> SudoServer 有意提供任意管理员/root 命令执行能力，是安全敏感组件。请先阅读 [安全模型](#安全模型与已知边界)，不要把端口暴露到网络。
+
+## 为什么给 AI 使用
+
+沙箱适合阻止 Agent 在未经允许时修改系统，但也会阻断用户真正想让它完成的工作。缺少标准提权路径时，Agent 往往只能反复尝试受限命令、设计脆弱的绕行方案，或者频繁打断用户。
+
+SudoServer 提供一条简单、确定且失败关闭的路径：
+
+- **不和沙箱对抗**：需要高权限时直接走 SudoServer，不尝试 sandbox escape 或临时拼装提权技巧。
+- **用户掌握授权**：Agent 只向用户索要 JWT，永远不接触 Master Password 或 Authenticator 动态码。
+- **原生脚本体验**：命令交给真实的持久化 `pwsh`，而不是由服务自行解析或阉割 PowerShell 语法。
+- **少打扰**：一个 token 自动复用一个会话，变量、工作目录和环境可以跨命令保持，不必每执行一步都重新授权。
+- **边界明确**：撤销 token 会终止它的会话；handle 和签名校验出错只会拒绝执行，不会降级到不安全路径。
+
+典型工作流只有四步：
+
+```text
+Agent 判断任务需要管理员/root 权限
+    → 通过 Ask 请求 SudoServer JWT
+    → 用户在本地页面签发并粘贴 JWT
+    → Agent 进入会话、完成任务并销毁会话
+```
+
+一次授权对应一段任务。SudoServer 不引入桌面弹窗、托盘程序或异步审批状态机，以免提权路径本身变得比沙箱更难用、更难测试。
+
+## 核心能力
 
 - Windows 与 Linux 单一 Rust 二进制；服务启动时强制检查 Administrator/root 身份。
 - 每次进程启动生成全新的 Ed25519 密钥对；此前签发的所有 JWT 会自然失效。
@@ -51,7 +78,35 @@ Windows 注册为 `SudoServer` 自启动服务并以 LocalSystem 运行；Linux 
 - MCP：`http://127.0.0.1:32119/mcp`
 - 健康检查：`http://127.0.0.1:32119/health`
 
-将 [skills/use-sudoserver](skills/use-sudoserver/SKILL.md) 安装到 Agent 的 skills 目录。Skill 会要求 Agent 优先使用 Ask 工具索要 JWT、展示 sudo 的三条警示，并禁止索要 Master Password/TOTP。
+## 接入 AI Agent
+
+将 Agent 的 MCP 客户端连接到：
+
+```text
+http://127.0.0.1:32119/mcp
+```
+
+以常见的 MCP 配置形式表示：
+
+```json
+{
+  "mcpServers": {
+    "sudoserver": {
+      "url": "http://127.0.0.1:32119/mcp"
+    }
+  }
+}
+```
+
+具体配置文件位置取决于所使用的 Agent。连接成功后应能看到 `sudo_enter`、`sudo_run`、`sudo_destroy_session` 和 `sudo_revoke_token` 四个工具。
+
+同时将 [skills/use-sudoserver](skills/use-sudoserver/SKILL.md) 安装到 Agent 的 skills 目录。这个 Skill 告诉 Agent：
+
+- 权限不足时优先使用 SudoServer，不要和沙箱反复周旋。
+- 优先通过 Ask/user-input 工具向用户索要 JWT。
+- 索要授权时展示 sudo 的三条警示，让用户理解自己正在授予什么能力。
+- 绝不索要、接收或尝试发现 Master Password/TOTP。
+- 完成工作后销毁会话，并在不再需要时撤销令牌。
 
 ## API 概览
 
