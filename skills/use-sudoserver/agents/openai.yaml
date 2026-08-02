@@ -1,0 +1,4 @@
+interface:
+  display_name: "SudoServer"
+  short_description: "Run privileged scripts without fighting the agent sandbox"
+  default_prompt: "Use $use-sudoserver to run the required privileged script safely instead of working around the agent sandbox."

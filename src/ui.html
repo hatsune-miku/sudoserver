@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>SudoServer 权限令牌</title>
+  <style>
+    :root{color-scheme:dark;--bg:#0b0d10;--panel:#15191e;--line:#303842;--text:#e9eef5;--muted:#9ca9b7;--red:#ff6b6b;--green:#58d68d;--accent:#79b8ff}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif}.wrap{max-width:820px;margin:48px auto;padding:0 20px}h1{font-size:28px;margin:0 0 8px}.sub{color:var(--muted);margin:0 0 28px}.warning{border:1px solid #7c3434;background:#291719;padding:16px 18px;border-radius:10px;margin-bottom:20px}.warning strong{color:#ff9494}.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px;margin:16px 0}label{display:block;color:var(--muted);font-size:13px;margin:12px 0 5px}input,select,button,textarea{font:inherit}input,select{width:100%;color:var(--text);background:#0e1115;border:1px solid var(--line);border-radius:7px;padding:10px}button{border:0;border-radius:7px;background:var(--accent);color:#07111d;font-weight:650;padding:10px 16px;cursor:pointer;margin-top:16px}button.danger{background:var(--red);color:#220606;margin:0}.row{display:grid;grid-template-columns:1fr 1fr;gap:14px}.result{display:none;margin-top:18px}.token{display:block;width:100%;min-height:110px;background:#080a0c;color:#b9ffc9;border:1px solid var(--line);border-radius:7px;padding:10px;word-break:break-all}.status{min-height:24px;margin-top:12px;color:var(--muted)}.ok{color:var(--green)}.err{color:var(--red)}table{width:100%;border-collapse:collapse;margin-top:12px;font-size:13px}th,td{text-align:left;border-bottom:1px solid var(--line);padding:9px 6px}code{font-family:ui-monospace,monospace}@media(max-width:620px){.row{grid-template-columns:1fr}.wrap{margin-top:24px}}
+  </style>
+</head>
+<body><main class="wrap">
+  <h1>SudoServer</h1><p class="sub">签发与管理本次系统启动周期内的提权令牌</p>
+  <div class="warning"><strong>你将授予完整的管理员/root 权限。</strong><br>持有令牌的程序可以代表你修改系统、安装软件、删除数据。只在你理解并同意具体任务时签发；完成后立即撤销。</div>
+  <section class="card">
+    <h2>身份验证</h2>
+    <div class="row"><div><label for="kind">验证方式</label><select id="kind"><option value="password">Master Password</option><option value="totp">Authenticator 动态密码</option></select></div><div><label for="credential">密码 / 6 位动态码</label><input id="credential" type="password" autocomplete="current-password"></div></div>
+  </section>
+  <section class="card">
+    <h2>签发新令牌</h2><label for="duration">有效期</label><select id="duration"><option value="86400">24 小时（默认）</option><option value="3600">1 小时</option><option value="900">15 分钟</option><option value="604800">7 天</option><option value="permanent">永久（直到服务重启或手动撤销）</option></select><button id="issue">确认授权并签发</button>
+    <div id="issueResult" class="result"><label>令牌只显示在这里，请交给需要提权的 Agent</label><textarea id="token" class="token" readonly></textarea><button id="copy">复制令牌</button></div><div id="status" class="status"></div>
+  </section>
+  <section class="card"><h2>本次运行已签发令牌</h2><button id="refresh">验证身份并刷新列表</button><div id="tokens"></div></section>
+</main><script>
+const $=id=>document.getElementById(id); const credential=()=>({type:$('kind').value,value:$('credential').value});
+async function api(path,body){const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const data=await r.json().catch(()=>({error:r.statusText}));if(!r.ok)throw new Error(data.error||r.statusText);return data}
+function status(message,error=false){$('status').textContent=message;$('status').className='status '+(error?'err':'ok')}
+$('issue').onclick=async()=>{try{const d=$('duration').value;if(d==='permanent'&&!confirm('永久令牌风险很高，并且仍会在 SudoServer/系统重启后失效。继续吗？'))return;const body={credential:credential(),permanent:d==='permanent'};if(d!=='permanent')body.ttl_seconds=Number(d);const data=await api('/v1/admin/tokens/issue',body);$('token').value=data.token;$('issueResult').style.display='block';status('令牌已签发。请在任务结束后撤销。');await refresh()}catch(e){status(e.message,true)}};
+$('copy').onclick=async()=>{await navigator.clipboard.writeText($('token').value);status('已复制到剪贴板。')};
+async function refresh(){try{const rows=await api('/v1/admin/tokens/list',{credential:credential()});$('tokens').innerHTML='<table><tr><th>标识</th><th>签发时间</th><th>到期时间</th><th>状态</th><th></th></tr>'+rows.map(r=>`<tr><td><code>${r.jti.slice(0,8)}</code></td><td>${new Date(r.issued_at*1000).toLocaleString()}</td><td>${r.expires_at?new Date(r.expires_at*1000).toLocaleString():'永久'}</td><td>${r.revoked?'已撤销':'有效'}</td><td>${r.revoked?'':`<button class="danger" data-jti="${r.jti}">撤销</button>`}</td></tr>`).join('')+'</table>';$('tokens').querySelectorAll('button').forEach(b=>b.onclick=()=>revoke(b.dataset.jti));status('列表已刷新。')}catch(e){status(e.message,true)}}
+async function revoke(jti){if(!confirm('撤销令牌并立即终止其会话？'))return;try{await api('/v1/admin/tokens/revoke',{credential:credential(),jti});await refresh()}catch(e){status(e.message,true)}}
+$('refresh').onclick=refresh;
+</script></body></html>

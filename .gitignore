@@ -1,0 +1,50 @@
+# Rust / Cargo build output
+/target/
+**/*.rs.bk
+rust-project.json
+
+# SudoServer local runtime state and secrets
+/.sudoserver/
+/config.toml
+/sudoserver.local.toml
+**/seal.key
+*.jwt
+*.token
+
+# Environment files (keep shareable templates)
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Test, coverage, profiling, and benchmark output
+/coverage/
+/criterion/
+*.profraw
+*.profdata
+*.lcov
+lcov.info
+tarpaulin-report.html
+
+# Logs, temporary files, and editor backups
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*~
+
+# IDE-local state
+/.idea/
+/.vscode/
+*.sublime-workspace
+
+# Operating-system metadata
+.DS_Store
+._*
+Thumbs.db
+Desktop.ini
+
+# Keep Cargo.lock committed: SudoServer is an application, not a library.
+!Cargo.lock
