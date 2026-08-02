@@ -155,7 +155,7 @@ cargo test --all-targets
 
 集成测试会调用本机 `pwsh` 验证管道、通配符、多行、Unicode、错误流、原生命令退出码、状态继承，以及完整 HTTP 签发/复用/执行/撤销生命周期。CI 在 Windows 和 Linux 上运行相同测试并产出 release 二进制。
 
-需要发布候选版本时，在 GitHub Actions 中手动运行 `Release Candidate`，输入形如 `v0.1.0-rc.1` 的 tag。工作流会等待 Windows 和 Linux 两端全部测试、构建及打包成功，再生成 `SHA256SUMS` 并创建 GitHub prerelease。正式版 `Release` 工作流明确排除 `-rc.*` tag。
+`main` 分支上的 push 触发 `CI` 后，只有 Windows 和 Linux 两端全部测试、构建并上传成品成功，`Release Candidate` 才会接续运行。它直接下载该次 CI 的两端成品（不重复构建），打包、生成 `SHA256SUMS`，并以 `v<项目版本>-rc.<CI序号>.<重试序号>` 创建 GitHub prerelease。PR 检查不会发布 RC；正式版 `Release` 工作流也明确排除 `-rc.*` tag。
 
 ## License
 

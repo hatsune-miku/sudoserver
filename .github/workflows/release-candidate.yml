@@ -1,106 +1,85 @@
 name: Release Candidate
-run-name: Release candidate ${{ inputs.tag }}
+run-name: Release candidate from CI #${{ github.event.workflow_run.run_number }}
 
 on:
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: Release candidate tag (for example, v0.1.0-rc.1)
-        required: true
-        type: string
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
 
 permissions:
+  actions: read
   contents: write
 
 concurrency:
-  group: release-candidate-${{ inputs.tag }}
+  group: release-candidate-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
   cancel-in-progress: false
 
 jobs:
-  build:
-    name: Build ${{ matrix.platform }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: windows-x86_64
-            os: windows-latest
-            asset: sudoserver-windows-x86_64.zip
-          - platform: linux-x86_64
-            os: ubuntu-latest
-            asset: sudoserver-linux-x86_64.tar.gz
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - name: Cache Rust dependencies and build artifacts
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-cargo-
-      - name: Verify PowerShell
-        shell: pwsh
-        run: $PSVersionTable.PSVersion
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --all-targets
-      - run: cargo build --release
-      - name: Package Windows binary
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Path staging
-          Copy-Item target/release/sudoserver.exe, README.md, LICENSE-MIT staging/
-          Compress-Archive -Path staging/* -DestinationPath '${{ matrix.asset }}'
-      - name: Package Linux binary
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          mkdir staging
-          cp target/release/sudoserver README.md LICENSE-MIT staging/
-          tar -czf '${{ matrix.asset }}' -C staging .
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.platform }}
-          path: ${{ matrix.asset }}
-          if-no-files-found: error
-
   create-candidate:
-    name: Create prerelease
-    needs: build
+    name: Package CI artifacts and create prerelease
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main'
     runs-on: ubuntu-latest
     steps:
-      - name: Validate release candidate tag
-        env:
-          RC_TAG: ${{ inputs.tag }}
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Download Windows and Linux artifacts from CI
+        uses: actions/download-artifact@v4
+        with:
+          pattern: sudoserver-*
+          path: binaries
+          merge-multiple: true
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+
+      - name: Verify and package both platforms
         shell: bash
         run: |
-          if [[ ! "$RC_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$ ]]; then
-            echo "Expected tag format vX.Y.Z-rc.N; got: $RC_TAG" >&2
+          windows_binary="$(find binaries -type f -name 'sudoserver.exe' -print -quit)"
+          linux_binary="$(find binaries -type f -name 'sudoserver' -print -quit)"
+          test -n "$windows_binary" || { echo 'Windows artifact is missing' >&2; exit 1; }
+          test -n "$linux_binary" || { echo 'Linux artifact is missing' >&2; exit 1; }
+
+          mkdir -p packages/SudoServer-windows-x86_64 packages/SudoServer-linux-x86_64 assets
+          cp "$windows_binary" packages/SudoServer-windows-x86_64/
+          cp "$linux_binary" packages/SudoServer-linux-x86_64/
+          chmod +x packages/SudoServer-linux-x86_64/sudoserver
+          cp README.md LICENSE-MIT packages/SudoServer-windows-x86_64/
+          cp README.md LICENSE-MIT packages/SudoServer-linux-x86_64/
+
+          (cd packages && zip -qr ../assets/sudoserver-windows-x86_64.zip SudoServer-windows-x86_64)
+          tar -czf assets/sudoserver-linux-x86_64.tar.gz -C packages SudoServer-linux-x86_64
+          (cd assets && sha256sum sudoserver-* > SHA256SUMS)
+
+      - name: Derive release candidate version
+        id: version
+        env:
+          RUN_NUMBER: ${{ github.event.workflow_run.run_number }}
+          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        shell: bash
+        run: |
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid Cargo package version: $version" >&2
             exit 1
           fi
-      - uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-          merge-multiple: true
-      - name: Generate checksums
-        shell: bash
-        run: sha256sum artifacts/* > SHA256SUMS
+          tag="v${version}-rc.${RUN_NUMBER}.${RUN_ATTEMPT}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
       - name: Create GitHub prerelease
         env:
           GH_TOKEN: ${{ github.token }}
-          RC_TAG: ${{ inputs.tag }}
+          RC_TAG: ${{ steps.version.outputs.tag }}
+          TARGET_SHA: ${{ github.event.workflow_run.head_sha }}
         shell: bash
         run: |
-          gh release create "$RC_TAG" artifacts/* SHA256SUMS \
+          gh release create "$RC_TAG" assets/* \
             --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
+            --target "$TARGET_SHA" \
             --title "SudoServer $RC_TAG" \
             --generate-notes \
             --prerelease
