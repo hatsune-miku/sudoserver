@@ -41,14 +41,14 @@ pub struct PowerShell {
 
 impl PowerShell {
     pub async fn spawn(executable: &str, max_output_bytes: usize) -> Result<Self, ShellError> {
+        let bootstrap = encode_powershell(BOOTSTRAP_SCRIPT);
         let mut child = Command::new(executable)
             .args([
                 "-NoLogo",
                 "-NoProfile",
                 "-NonInteractive",
-                "-NoExit",
-                "-Command",
-                "-",
+                "-EncodedCommand",
+                &bootstrap,
             ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -58,19 +58,12 @@ impl PowerShell {
             .map_err(ShellError::Start)?;
         let stdin = child.stdin.take().ok_or(ShellError::Ended)?;
         let stdout = child.stdout.take().ok_or(ShellError::Ended)?;
-        let mut shell = Self {
+        let shell = Self {
             child,
             stdin,
             stdout: BufReader::new(stdout),
             max_output_bytes,
         };
-        // Force deterministic UTF-8 output without changing the user's PowerShell profile.
-        shell
-            .stdin
-            .write_all(b"[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);$OutputEncoding=[Console]::OutputEncoding\n")
-            .await
-            .map_err(ShellError::Io)?;
-        shell.stdin.flush().await.map_err(ShellError::Io)?;
         Ok(shell)
     }
 
@@ -101,13 +94,11 @@ impl PowerShell {
         OsRng.fill_bytes(&mut marker_bytes);
         let marker = format!("__SUDOSERVER_{}__", STANDARD.encode(marker_bytes));
         let encoded = STANDARD.encode(command.as_bytes());
-        // The user script is handed to PowerShell's own parser. Capturing *>&1 keeps all
-        // PowerShell streams ordered; the random marker frames one request on the persistent process.
-        let wrapper = format!(
-            "$__ss_s=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{encoded}'));$__ss_ec=0;$__ss_o='';try{{$global:LASTEXITCODE=0;$__ss_errors=$global:Error.Count;$__ss_items=. ([ScriptBlock]::Create($__ss_s)) *>&1;$__ss_ec=if($LASTEXITCODE -ne 0){{[int]$LASTEXITCODE}}elseif($global:Error.Count -gt $__ss_errors){{1}}else{{0}};$__ss_o=$__ss_items|Out-String -Width 32767}}catch{{$__ss_ec=1;$__ss_o=$_|Out-String -Width 32767}};$__ss_b=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$__ss_o));[Console]::Out.WriteLine('{marker}'+$__ss_ec+'|'+$__ss_b)\n"
-        );
+        // The bootstrap reads exactly one line per request. The command itself is Base64,
+        // so multiline scripts and every PowerShell metacharacter pass through untouched.
+        let request = format!("{marker}|{encoded}\n");
         self.stdin
-            .write_all(wrapper.as_bytes())
+            .write_all(request.as_bytes())
             .await
             .map_err(ShellError::Io)?;
         self.stdin.flush().await.map_err(ShellError::Io)?;
@@ -124,7 +115,12 @@ impl PowerShell {
                 return Err(ShellError::Ended);
             }
             let trimmed = line.trim_end_matches(['\r', '\n']);
-            if let Some(response) = trimmed.strip_prefix(&marker) {
+            if let Some(marker_start) = trimmed.find(&marker) {
+                // PowerShell's Unix ConsoleHost can emit terminal control bytes before host
+                // output even when stdout is redirected. Preserve genuine direct console
+                // output and, critically, do not require the protocol marker at column zero.
+                incidental.extend_from_slice(&trimmed.as_bytes()[..marker_start]);
+                let response = &trimmed[marker_start + marker.len()..];
                 let (exit_code, payload) = response
                     .split_once('|')
                     .ok_or(ShellError::InvalidResponse)?;
@@ -159,6 +155,47 @@ impl PowerShell {
     }
 }
 
+// Run a protocol loop inside one PowerShell script rather than feeding source to
+// `pwsh -Command -`. The latter delegates statement framing to ConsoleHost and has
+// observably different redirected-stdin/terminal behavior on Unix and Windows.
+const BOOTSTRAP_SCRIPT: &str = r#"
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+$OutputEncoding = [Console]::OutputEncoding
+while (($__ss_line = [Console]::In.ReadLine()) -ne $null) {
+    $__ss_separator = $__ss_line.IndexOf('|')
+    if ($__ss_separator -le 0) { continue }
+    $__ss_marker = $__ss_line.Substring(0, $__ss_separator)
+    $__ss_encoded = $__ss_line.Substring($__ss_separator + 1)
+    $__ss_ec = 0
+    $__ss_o = ''
+    try {
+        $__ss_s = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($__ss_encoded))
+        $global:LASTEXITCODE = 0
+        $__ss_errors = $global:Error.Count
+        $__ss_items = . ([ScriptBlock]::Create($__ss_s)) *>&1
+        $__ss_ec = if ($LASTEXITCODE -ne 0) {
+            [int]$LASTEXITCODE
+        } elseif ($global:Error.Count -gt $__ss_errors) {
+            1
+        } else {
+            0
+        }
+        $__ss_o = $__ss_items | Out-String -Width 32767
+    } catch {
+        $__ss_ec = 1
+        $__ss_o = $_ | Out-String -Width 32767
+    }
+    $__ss_b = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$__ss_o))
+    [Console]::Out.WriteLine($__ss_marker + $__ss_ec + '|' + $__ss_b)
+    [Console]::Out.Flush()
+}
+"#;
+
+fn encode_powershell(script: &str) -> String {
+    let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    STANDARD.encode(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,6 +206,12 @@ mod tests {
             Err(ShellError::Start(error)) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => panic!("{error}"),
         }
+    }
+
+    #[test]
+    fn bootstrap_is_encoded_as_utf16le_for_powershell() {
+        let encoded = encode_powershell("'ok'");
+        assert_eq!(STANDARD.decode(encoded).unwrap(), b"'\0o\0k\0'\0");
     }
 
     #[tokio::test]
@@ -208,6 +251,23 @@ mod tests {
             .await
             .unwrap();
         assert!(result.output.contains("persisted/yes"));
+    }
+
+    #[tokio::test]
+    async fn accepts_output_before_the_protocol_marker() {
+        let Some(mut shell) = shell().await else {
+            return;
+        };
+        let result = shell
+            .execute(
+                "[Console]::Out.Write('direct-without-newline:'); 'captured'",
+                10,
+            )
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("direct-without-newline:"));
+        assert!(result.output.contains("captured"));
     }
 
     #[tokio::test]

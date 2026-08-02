@@ -1,0 +1,106 @@
+name: Release Candidate
+run-name: Release candidate ${{ inputs.tag }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release candidate tag (for example, v0.1.0-rc.1)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-candidate-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x86_64
+            os: windows-latest
+            asset: sudoserver-windows-x86_64.zip
+          - platform: linux-x86_64
+            os: ubuntu-latest
+            asset: sudoserver-linux-x86_64.tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Cache Rust dependencies and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-
+      - name: Verify PowerShell
+        shell: pwsh
+        run: $PSVersionTable.PSVersion
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --all-targets
+      - run: cargo build --release
+      - name: Package Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path staging
+          Copy-Item target/release/sudoserver.exe, README.md, LICENSE-MIT staging/
+          Compress-Archive -Path staging/* -DestinationPath '${{ matrix.asset }}'
+      - name: Package Linux binary
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          mkdir staging
+          cp target/release/sudoserver README.md LICENSE-MIT staging/
+          tar -czf '${{ matrix.asset }}' -C staging .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
+
+  create-candidate:
+    name: Create prerelease
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate release candidate tag
+        env:
+          RC_TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          if [[ ! "$RC_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$ ]]; then
+            echo "Expected tag format vX.Y.Z-rc.N; got: $RC_TAG" >&2
+            exit 1
+          fi
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Generate checksums
+        shell: bash
+        run: sha256sum artifacts/* > SHA256SUMS
+      - name: Create GitHub prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RC_TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          gh release create "$RC_TAG" artifacts/* SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "SudoServer $RC_TAG" \
+            --generate-notes \
+            --prerelease
