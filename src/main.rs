@@ -169,7 +169,7 @@ where
         None => None,
     };
     let auth = AuthManager::new(config.password_hash.clone(), totp_secret);
-    tracing::info!(bind = %config.bind, public_key = %auth.public_key_base64(), "runtime Ed25519 key generated");
+    tracing::info!(bind = %config.bind, "runtime token store initialized");
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     println!("SudoServer management UI: http://{}/", config.bind);
     axum::serve(listener, router(AppState::new(config, auth)))

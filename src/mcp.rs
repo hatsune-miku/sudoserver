@@ -2,7 +2,13 @@ use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::server::{ApiError, AppState};
+use crate::{
+    mcp_text::{
+        MISSING_TOOL_NAME, SERIALIZATION_FAILED, SERVER_INSTRUCTIONS, missing_string_argument,
+        tool_definitions, unknown_method, unknown_tool,
+    },
+    server::{ApiError, AppState},
+};
 
 #[derive(Deserialize)]
 pub struct JsonRpcRequest {
@@ -39,14 +45,12 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
             "protocolVersion": "2025-06-18",
             "capabilities": { "tools": { "listChanged": false } },
             "serverInfo": { "name": "SudoServer", "version": env!("CARGO_PKG_VERSION") },
-            "instructions": "Every tool can make unrestricted administrator/root changes. Never ask for a Master Password or TOTP. Ask the user for a JWT and ensure they understand the authority they are granting."
+            "instructions": SERVER_INSTRUCTIONS
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({ "tools": tool_definitions() })),
         "tools/call" => call_tool(state, params).await,
-        _ => Err(ApiError::bad_request(format!(
-            "unknown MCP method: {method}"
-        ))),
+        _ => Err(ApiError::bad_request(unknown_method(method))),
     }
 }
 
@@ -54,7 +58,7 @@ async fn call_tool(state: &AppState, params: Value) -> Result<Value, ApiError> {
     let name = params
         .get("name")
         .and_then(Value::as_str)
-        .ok_or_else(|| ApiError::bad_request("missing tool name"))?;
+        .ok_or_else(|| ApiError::bad_request(MISSING_TOOL_NAME))?;
     let arguments = params
         .get("arguments")
         .cloned()
@@ -65,7 +69,7 @@ async fn call_tool(state: &AppState, params: Value) -> Result<Value, ApiError> {
             let result = state.enter(token).await?;
             tool_json(
                 serde_json::to_value(result)
-                    .map_err(|_| ApiError::internal("serialization failed"))?,
+                    .map_err(|_| ApiError::internal(SERIALIZATION_FAILED))?,
             )
         }
         "sudo_run" => {
@@ -75,7 +79,7 @@ async fn call_tool(state: &AppState, params: Value) -> Result<Value, ApiError> {
             let result = state.run(handle, command, timeout).await?;
             tool_json(
                 serde_json::to_value(result)
-                    .map_err(|_| ApiError::internal("serialization failed"))?,
+                    .map_err(|_| ApiError::internal(SERIALIZATION_FAILED))?,
             )
         }
         "sudo_destroy_session" => {
@@ -88,7 +92,7 @@ async fn call_tool(state: &AppState, params: Value) -> Result<Value, ApiError> {
             state.revoke_token(string_arg(&arguments, "token")?).await?;
             tool_json(json!({ "revoked": true }))
         }
-        _ => Err(ApiError::bad_request(format!("unknown tool: {name}"))),
+        _ => Err(ApiError::bad_request(unknown_tool(name))),
     }
 }
 
@@ -96,7 +100,7 @@ fn string_arg<'a>(arguments: &'a Value, name: &str) -> Result<&'a str, ApiError>
     arguments
         .get(name)
         .and_then(Value::as_str)
-        .ok_or_else(|| ApiError::bad_request(format!("missing string argument: {name}")))
+        .ok_or_else(|| ApiError::bad_request(missing_string_argument(name)))
 }
 
 fn tool_json(value: Value) -> Result<Value, ApiError> {
@@ -105,53 +109,6 @@ fn tool_json(value: Value) -> Result<Value, ApiError> {
         "structuredContent": value,
         "isError": false
     }))
-}
-
-fn tool_definitions() -> Value {
-    json!([
-        {
-            "name": "sudo_enter",
-            "title": "Enter privileged session",
-            "description": "Enter an unrestricted administrator/root PowerShell session using a JWT personally issued by the user. Never ask for the Master Password or dynamic Master Password. If this token already owns a live session, the existing strong-password handle is returned and reused; otherwise a new session is created.",
-            "inputSchema": {
-                "type": "object",
-                "properties": { "token": { "type": "string", "description": "JWT supplied by the user via the agent's Ask/user-input tool" } },
-                "required": ["token"], "additionalProperties": false
-            }
-        },
-        {
-            "name": "sudo_run",
-            "title": "Run privileged PowerShell",
-            "description": "Run the command verbatim in the persistent privileged PowerShell session. PowerShell itself parses pipelines, wildcards, multiline scripts and environment variables. State, current directory and environment persist between calls. Output streams are merged in PowerShell order.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "handle": { "type": "string", "description": "Secret session handle returned by sudo_enter" },
-                    "command": { "type": "string", "description": "PowerShell source code, passed verbatim to PowerShell's parser" },
-                    "timeout_seconds": { "type": "integer", "minimum": 1 }
-                },
-                "required": ["handle", "command"], "additionalProperties": false
-            }
-        },
-        {
-            "name": "sudo_destroy_session",
-            "title": "Destroy privileged session",
-            "description": "Immediately terminate a privileged PowerShell session and invalidate its handle.",
-            "inputSchema": {
-                "type": "object", "properties": { "handle": { "type": "string" } },
-                "required": ["handle"], "additionalProperties": false
-            }
-        },
-        {
-            "name": "sudo_revoke_token",
-            "title": "Revoke privilege token",
-            "description": "Revoke a JWT and immediately terminate every session that it owns.",
-            "inputSchema": {
-                "type": "object", "properties": { "token": { "type": "string" } },
-                "required": ["token"], "additionalProperties": false
-            }
-        }
-    ])
 }
 
 #[cfg(test)]

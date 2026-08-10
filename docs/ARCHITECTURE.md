@@ -12,7 +12,7 @@ Browser / Agent
   ▼
 Axum transport ── admin authentication ── Argon2id / RFC 6238
   │
-  ├─ runtime Ed25519 JWT issuer + in-memory revocation metadata
+  ├─ in-memory opaque token registry + authorization metadata
   │
   └─ token → strong handle → persistent pwsh child process
                               (native parser and session state)
@@ -28,9 +28,9 @@ Axum transport ── admin authentication ── Argon2id / RFC 6238
 
 这比“每次调用启动一个 shell”多一些 framing 复杂度，但保留了变量、环境和当前目录，符合会话语义。比自行实现 shell grammar 可靠得多。命令本身拥有 root 权限，因此刻意伪造 framing 不构成额外权限提升。
 
-### 动态密钥
+### 短期令牌
 
-Ed25519 signing key 只在内存中生成和持有。JWT 包含 instance issuer、audience、subject、jti、iat 和可选 exp。验证同时要求签名、当前 instance id 和内存中的签发记录匹配，因此重启后的 token 即使声明永久也无法使用。
+令牌由 CSPRNG 生成，使用 22 位纯 ASCII 字母数字 Base62 编码，约有 131 bit 熵。原始令牌只在签发时返回一次，服务端仅在内存中保存 SHA-256 哈希、管理 ID、签发时间、到期时间和撤销状态。服务重启后内存记录消失，因此即使声明永久的令牌也会自然失效。
 
 ### 凭据存储
 
@@ -38,17 +38,17 @@ Master Password 只保存 Argon2id PHC verifier。TOTP 验证在数学上必须�
 
 ### 网络边界
 
-纯 HTTP 只适合 loopback。配置验证硬性拒绝非 loopback bind，避免用户误把 Master Password、JWT 或 handle 发送到明文网络。远程版本需要不同的威胁模型（至少 TLS、服务器身份验证、推荐 mTLS），不应通过一个 `allow_remote` 开关草率实现。
+纯 HTTP 只适合 loopback。配置验证硬性拒绝非 loopback bind，避免用户误把 Master Password、token 或 handle 发送到明文网络。远程版本需要不同的威胁模型（至少 TLS、服务器身份验证、推荐 mTLS），不应通过一个 `allow_remote` 开关草率实现。
 
 ## 需求覆盖
 
 | 原始需求 | 实现 |
 |---|---|
 | Windows Administrator / Linux root | 启动身份检查；SCM LocalSystem / systemd root |
-| 每次运行动态密钥对 | Ed25519 key 每进程生成，不落盘 |
+| 每次运行令牌自然失效 | opaque token 元数据只保存在进程内存中 |
 | 用户亲自签发 token | 本地 UI + Argon2id Master / TOTP |
 | 默认 24h、可永久 | issue API 和 UI presets |
-| 一个 token 一个 session | 双向 token-jti/handle map，明确 reused 响应 |
+| 一个 token 一个 session | 双向 token-id/handle map，明确 reused 响应 |
 | handle 是强密码 | CSPRNG 256 bit base64url |
 | 完整 PowerShell 语义 | 持久化 `pwsh` 原生解析，跨平台集成测试 |
 | 销毁 session/token | 立即移除映射并 kill shell；撤销级联 |
