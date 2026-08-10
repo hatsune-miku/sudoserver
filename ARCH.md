@@ -2,7 +2,7 @@
 
 ## 功能简介
 
-将本机的 “以管理员权限 / root 权限运行任意 powershell 会话” 的能力，同时通过 HTTP API 和 MCP 协议服务出去，会话的开启通过令牌鉴权，用户本人可通过 Master Password 来签发令牌，令牌能且只能由用户亲自签发。SudoServer 每次运行，都在内存中动态地生成新密钥对。需要额外支持用户通过 Authenticator App 来使用动态 Master Password，至少需要兼容 Proton Authenticator。
+将本机的 “以管理员权限 / root 权限运行任意 powershell 会话” 的能力，同时通过 HTTP API 和 MCP 协议服务出去，会话的开启通过短随机令牌鉴权，用户本人可通过 Master Password 来签发令牌，令牌能且只能由用户亲自签发。令牌及其有效期、撤销状态等授权元数据只在 SudoServer 进程内存中维护。需要额外支持用户通过 Authenticator App 来使用动态 Master Password，至少需要兼容 Proton Authenticator。
 
 ## Why SudoServer
 
@@ -13,7 +13,7 @@
 - 需兼容 Windows 和 Linux
 - 需生成 GitHub Actions 用于自动化构建两端的二进制
 - 需生成配套 Agent Skill，其中至少要求：
-  - 让 AI 在使用 SudoServer 时，优先通过大概率集成于 Agent 的 "Ask" tool 来向用户索要 jwt。
+  - 让 AI 在使用 SudoServer 时，优先通过大概率集成于 Agent 的 "Ask" tool 来向用户索要 SudoServer token。
   - 绝对不要向用户索要 Master Password 或者动态 Master Password。
   - Ask 的时候，带上 Linux 通常给 Sudo 用户看的那三条要点，给用户看，确保用户充分理解 “自己正在给出权限、允许 AI 代表自己进行系统改动” 这件事。
 - 建议分为 2 个模块：
@@ -29,7 +29,7 @@
     - 需额外考虑命令的执行身份、环境变量如何继承的问题。
   - 销毁特权会话（参数：会话handle）
   - 销毁令牌（参数：令牌）
-  - 用户签发的令牌默认有效期为 24 小时，用户可修改有效期，最长可选永久。不过需要提醒用户：由于密钥对动态生成的特性，通常当用户重启系统后，此前签发的任何令牌，不论有效期，都会自然失效。
+  - 用户签发的令牌默认有效期为 24 小时，用户可修改有效期，最长可选永久。不过需要提醒用户：由于令牌记录只存在于进程内存，通常当用户重启系统后，此前签发的任何令牌，不论有效期，都会自然失效。
   - Windows 下，使用管理员（Administrators）身份；Linux 下，使用 root 权限。
 
 ## 信任边界

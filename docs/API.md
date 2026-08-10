@@ -10,7 +10,7 @@
 POST /v1/sessions/enter
 Content-Type: application/json
 
-{"token":"<JWT>"}
+{"token":"<SUDOSERVER_TOKEN>"}
 ```
 
 返回 `{ "handle": "...", "reused": false, "message": "..." }`。同一 token 存在会话时，`reused` 为 `true` 且 handle 不变。
@@ -34,7 +34,7 @@ PowerShell 的 success/error/warning/verbose/debug/information 流按 PowerShell
 
 销毁会话：`POST /v1/sessions/destroy`，body 为 `{ "handle": "<HANDLE>" }`。
 
-撤销令牌：`POST /v1/tokens/revoke`，body 为 `{ "token": "<JWT>" }`。签名正确的过期 token 仍可用于撤销自身。
+撤销令牌：`POST /v1/tokens/revoke`，body 为 `{ "token": "<SUDOSERVER_TOKEN>" }`。服务仍持有记录的过期 token 可以用于撤销自身。
 
 ## 管理接口
 
@@ -51,8 +51,8 @@ credential 格式为：
 ```
 
 - `POST /v1/admin/tokens/issue`：`{"credential":...,"ttl_seconds":86400}`。省略有效期默认为 24 小时。永久令牌使用 `{"credential":...,"permanent":true}`。
-- `POST /v1/admin/tokens/list`：`{"credential":...}`。只返回 jti、签发/过期时间和撤销状态，不返回令牌。
-- `POST /v1/admin/tokens/revoke`：`{"credential":...,"jti":"..."}`。
+- `POST /v1/admin/tokens/list`：`{"credential":...}`。只返回 id、签发/过期时间和撤销状态，不返回令牌。
+- `POST /v1/admin/tokens/revoke`：`{"credential":...,"id":"..."}`。
 
 Master/TOTP 失败在每个进程实例内限制为 5 次/分钟；成功验证会清除失败计数。
 

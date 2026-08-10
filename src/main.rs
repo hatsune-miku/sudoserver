@@ -53,6 +53,8 @@ enum CommandKind {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Stop and unregister the native system service without deleting configuration.
+    Uninstall,
     /// Internal entry point used by the Windows Service Control Manager.
     #[cfg(windows)]
     #[command(hide = true)]
@@ -82,6 +84,7 @@ async fn main() -> Result<()> {
             allow_unelevated,
         } => serve(config_path(config)?, allow_unelevated).await,
         CommandKind::Install { config } => install(config_path(config)?),
+        CommandKind::Uninstall => uninstall(),
         #[cfg(windows)]
         CommandKind::Service { config } => windows_service_host::dispatch(config_path(config)?),
     }
@@ -169,7 +172,7 @@ where
         None => None,
     };
     let auth = AuthManager::new(config.password_hash.clone(), totp_secret);
-    tracing::info!(bind = %config.bind, public_key = %auth.public_key_base64(), "runtime Ed25519 key generated");
+    tracing::info!(bind = %config.bind, "runtime token store initialized");
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     println!("SudoServer management UI: http://{}/", config.bind);
     axum::serve(listener, router(AppState::new(config, auth)))
@@ -229,6 +232,28 @@ fn install(config_path: PathBuf) -> Result<()> {
     Ok(())
 }
 
+fn uninstall() -> Result<()> {
+    if !is_elevated()? {
+        bail!("service uninstallation requires Administrator/root");
+    }
+    #[cfg(target_os = "linux")]
+    let removed = uninstall_systemd()?;
+    #[cfg(windows)]
+    let removed = uninstall_windows_service()?;
+    #[cfg(not(any(target_os = "linux", windows)))]
+    let removed: bool = {
+        bail!("automatic service uninstallation is currently supported only on Windows and Linux")
+    };
+
+    if removed {
+        println!("SudoServer service stopped and uninstalled.");
+    } else {
+        println!("SudoServer service is not installed.");
+    }
+    println!("Configuration and seal.key were preserved.");
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 fn install_systemd(executable: &Path, config: &Path) -> Result<()> {
     let unit = format!(
@@ -236,9 +261,24 @@ fn install_systemd(executable: &Path, config: &Path) -> Result<()> {
         systemd_escape(executable),
         systemd_escape(config)
     );
-    fs::write("/etc/systemd/system/sudoserver.service", unit)?;
+    fs::write(SYSTEMD_UNIT_PATH, unit)?;
     checked(Command::new("systemctl").arg("daemon-reload"))?;
     checked(Command::new("systemctl").args(["enable", "--now", "sudoserver.service"]))
+}
+
+#[cfg(target_os = "linux")]
+const SYSTEMD_UNIT_PATH: &str = "/etc/systemd/system/sudoserver.service";
+
+#[cfg(target_os = "linux")]
+fn uninstall_systemd() -> Result<bool> {
+    let unit_path = Path::new(SYSTEMD_UNIT_PATH);
+    if !unit_path.exists() {
+        return Ok(false);
+    }
+    checked(Command::new("systemctl").args(["disable", "--now", "sudoserver.service"]))?;
+    fs::remove_file(unit_path)?;
+    checked(Command::new("systemctl").arg("daemon-reload"))?;
+    Ok(true)
 }
 
 #[cfg(target_os = "linux")]
@@ -279,6 +319,75 @@ fn install_windows_service(executable: &Path, config: &Path) -> Result<()> {
     checked(Command::new("sc.exe").args(["start", "SudoServer"]))
 }
 
+#[cfg(windows)]
+fn uninstall_windows_service() -> Result<bool> {
+    use std::{thread::sleep, time::Duration};
+
+    use windows_service::{
+        service::{ServiceAccess, ServiceState},
+        service_manager::{ServiceManager, ServiceManagerAccess},
+    };
+
+    const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
+    const ERROR_SERVICE_NOT_ACTIVE: i32 = 1062;
+    const ERROR_SERVICE_MARKED_FOR_DELETE: i32 = 1072;
+
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .context("failed to connect to the Windows Service Control Manager")?;
+    let access = ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE;
+    let service = match manager.open_service("SudoServer", access) {
+        Ok(service) => service,
+        Err(windows_service::Error::Winapi(error))
+            if error.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST) =>
+        {
+            return Ok(false);
+        }
+        Err(error) => return Err(error).context("failed to open the SudoServer service"),
+    };
+
+    match service.delete() {
+        Ok(()) => {}
+        Err(windows_service::Error::Winapi(error))
+            if error.raw_os_error() == Some(ERROR_SERVICE_MARKED_FOR_DELETE) => {}
+        Err(error) => {
+            return Err(error).context("failed to mark the SudoServer service for deletion");
+        }
+    }
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let mut stop_requested = false;
+    loop {
+        let state = service
+            .query_status()
+            .context("failed to query the SudoServer service status")?
+            .current_state;
+        match state {
+            ServiceState::Stopped => break,
+            ServiceState::Running | ServiceState::Paused if !stop_requested => {
+                match service.stop() {
+                    Ok(_) => stop_requested = true,
+                    Err(windows_service::Error::Winapi(error))
+                        if error.raw_os_error() == Some(ERROR_SERVICE_NOT_ACTIVE) =>
+                    {
+                        stop_requested = true;
+                    }
+                    Err(error) => {
+                        return Err(error).context("failed to stop the SudoServer service");
+                    }
+                }
+            }
+            ServiceState::StopPending => stop_requested = true,
+            _ => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!("SudoServer was marked for deletion but did not stop within 15 seconds");
+        }
+        sleep(Duration::from_millis(200));
+    }
+    drop(service);
+    Ok(true)
+}
+
 fn checked(command: &mut Command) -> Result<()> {
     let description = format!("{command:?}");
     let output = command
@@ -291,4 +400,15 @@ fn checked(command: &mut Command) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_uninstall_subcommand() {
+        let cli = Cli::try_parse_from(["sudoserver", "uninstall"]).unwrap();
+        assert!(matches!(cli.command, CommandKind::Uninstall));
+    }
 }

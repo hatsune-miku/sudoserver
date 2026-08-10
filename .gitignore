@@ -48,3 +48,5 @@ Desktop.ini
 
 # Keep Cargo.lock committed: SudoServer is an application, not a library.
 !Cargo.lock
+
+ARCH.md

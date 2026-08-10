@@ -26,7 +26,7 @@ pub struct AppState {
 }
 
 struct Session {
-    token_jti: String,
+    token_id: String,
     expires_at: Option<i64>,
     shell: Arc<Mutex<PowerShell>>,
 }
@@ -114,9 +114,9 @@ impl AppState {
     }
 
     pub async fn enter(&self, token: &str) -> Result<EnterResult, ApiError> {
-        let claims = self.auth.lock().await.verify_token(token)?;
+        let authorization = self.auth.lock().await.verify_token(token)?;
         let mut sessions = self.sessions.lock().await;
-        if let Some(handle) = sessions.by_token.get(&claims.jti).cloned()
+        if let Some(handle) = sessions.by_token.get(&authorization.id).cloned()
             && sessions.by_handle.contains_key(&handle)
         {
             return Ok(EnterResult {
@@ -127,12 +127,14 @@ impl AppState {
         }
         let shell = PowerShell::spawn(&self.config.shell, self.config.max_output_bytes).await?;
         let handle = strong_handle();
-        sessions.by_token.insert(claims.jti.clone(), handle.clone());
+        sessions
+            .by_token
+            .insert(authorization.id.clone(), handle.clone());
         sessions.by_handle.insert(
             handle.clone(),
             Session {
-                token_jti: claims.jti,
-                expires_at: claims.exp,
+                token_id: authorization.id,
+                expires_at: authorization.expires_at,
                 shell: Arc::new(Mutex::new(shell)),
             },
         );
@@ -193,23 +195,23 @@ impl AppState {
     }
 
     pub async fn revoke_token(&self, token: &str) -> Result<(), ApiError> {
-        let jti = {
+        let token_id = {
             let mut auth = self.auth.lock().await;
-            let claims = auth.token_identity(token)?;
-            auth.revoke(&claims.jti)?;
-            claims.jti
+            let authorization = auth.token_identity(token)?;
+            auth.revoke(&authorization.id)?;
+            authorization.id
         };
-        self.destroy_sessions_for_token(&jti).await;
+        self.destroy_sessions_for_token(&token_id).await;
         Ok(())
     }
 
-    async fn destroy_sessions_for_token(&self, jti: &str) {
+    async fn destroy_sessions_for_token(&self, token_id: &str) {
         let shells = {
             let mut sessions = self.sessions.lock().await;
             let handles: Vec<_> = sessions
                 .by_handle
                 .iter()
-                .filter(|(_, session)| session.token_jti == jti)
+                .filter(|(_, session)| session.token_id == token_id)
                 .map(|(handle, _)| handle.clone())
                 .collect();
             handles
@@ -230,7 +232,7 @@ impl AppState {
 
 fn remove_session(store: &mut SessionStore, handle: &str) -> Option<Arc<Mutex<PowerShell>>> {
     let session = store.by_handle.remove(handle)?;
-    store.by_token.remove(&session.token_jti);
+    store.by_token.remove(&session.token_id);
     Some(session.shell)
 }
 
@@ -281,7 +283,7 @@ struct AdminListBody {
 #[derive(Deserialize)]
 struct AdminRevokeBody {
     credential: Credential,
-    jti: String,
+    id: String,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -378,8 +380,8 @@ async fn admin_revoke(
     Json(body): Json<AdminRevokeBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     state.authenticate(&body.credential).await?;
-    state.auth.lock().await.revoke(&body.jti)?;
-    state.destroy_sessions_for_token(&body.jti).await;
+    state.auth.lock().await.revoke(&body.id)?;
+    state.destroy_sessions_for_token(&body.id).await;
     Ok(Json(serde_json::json!({ "revoked": true })))
 }
 
@@ -442,6 +444,8 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         let token = issued["token"].as_str().unwrap();
+        assert_eq!(token.len(), 22);
+        assert!(token.bytes().all(|byte| byte.is_ascii_alphanumeric()));
 
         let (_, first) = request(&app, "/v1/sessions/enter", json!({ "token": token })).await;
         let (_, second) = request(&app, "/v1/sessions/enter", json!({ "token": token })).await;
@@ -485,6 +489,41 @@ mod tests {
             }),
         )
         .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn admin_lists_and_revokes_tokens_by_id() {
+        let app = test_app();
+        let credential = json!({ "type": "password", "value": "test master password" });
+        let (status, issued) = request(
+            &app,
+            "/v1/admin/tokens/issue",
+            json!({ "credential": credential.clone(), "ttl_seconds": 120 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let token = issued["token"].as_str().unwrap();
+        let id = issued["record"]["id"].as_str().unwrap();
+
+        let (status, records) = request(
+            &app,
+            "/v1/admin/tokens/list",
+            json!({ "credential": credential.clone() }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(records[0]["id"], id);
+        assert!(records[0].get("token").is_none());
+
+        let (status, _) = request(
+            &app,
+            "/v1/admin/tokens/revoke",
+            json!({ "credential": credential, "id": id }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = request(&app, "/v1/sessions/enter", json!({ "token": token })).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 }
