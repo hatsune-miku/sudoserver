@@ -68,7 +68,9 @@ async fn call_tool(state: &AppState, params: Value) -> Result<Value, ApiError> {
             let token = string_arg(&arguments, "token")?;
             let confirm_text = string_arg(&arguments, "confirm_text")?;
             if confirm_text != "OK" {
-                return Err(ApiError::bad_request(missing_string_argument("confirm_text")));
+                return Err(ApiError::bad_request(missing_string_argument(
+                    "confirm_text",
+                )));
             }
 
             let result = state.enter(token).await?;
