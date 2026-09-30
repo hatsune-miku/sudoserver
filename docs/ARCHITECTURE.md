@@ -2,7 +2,7 @@
 
 ## 结论
 
-原始需求在 Windows 与 Linux 上可行。跨平台的共同基础是 PowerShell 7 (`pwsh`)；认证、令牌和协议层可完全由安全 Rust 实现。真正的平台差异集中在服务生命周期、文件 ACL 和执行身份，因此二进制保留同一核心，在边缘使用 Windows SCM 与 systemd 适配。
+Windows 使用 PowerShell 7 (`pwsh`)，Linux/macOS 使用 `/bin/bash`（兼容 macOS Bash 3.2）。认证、令牌和协议层使用安全 Rust，共享持久会话抽象；平台差异集中在 shell 后端、服务生命周期、文件 ACL 和执行身份。服务适配分别为 Windows SCM、Linux systemd、macOS launchd。
 
 ## 组件
 
@@ -14,7 +14,7 @@ Axum transport ── admin authentication ── Argon2id / RFC 6238
   │
   ├─ in-memory opaque token registry + authorization metadata
   │
-  └─ token → strong handle → persistent pwsh child process
+  └─ token → strong handle → persistent PowerShell / Bash process
                               (native parser and session state)
 ```
 
@@ -24,9 +24,15 @@ Axum transport ── admin authentication ── Argon2id / RFC 6238
 
 ### 命令执行
 
-不自行解析、转义或重写用户命令。每个会话启动一个 `pwsh -NoProfile -NonInteractive -NoExit -Command -` 子进程，命令以 UTF-8→Base64 编码穿过 stdin framing，再由 `[ScriptBlock]::Create` 交给 PowerShell 原生 parser。随机 144-bit marker 将每个请求的结果定界；handle 自身为独立的 256-bit 随机秘密。
+不自行解析或重写用户命令。Windows 启动 `pwsh -NoProfile -NonInteractive -EncodedCommand` bootstrap，命令通过 UTF-8→Base64 编码传输，由 `[ScriptBlock]::Create` 原生解析并在当前作用域执行。Unix 启动 `/bin/bash --noprofile --norc -c` bootstrap，移除 `BASH_ENV` 等启动变量；命令通过八进制字节编码传输，由 Bash 内建 `printf -v` 无外部依赖地还原，再在父 shell 中 `eval`，不使用丢失状态的命令替换或子 shell。
+
+随机 144-bit marker 和控制字符将每个请求的完成帧定界；原始输出通过管道持续读取，仅保存配置容量内的部分，并在截断后继续排空。PowerShell 对象使用 `Out-String -Stream` 转成文本。handle 自身为独立的 256-bit 随机秘密。
 
 这比“每次调用启动一个 shell”多一些 framing 复杂度，但保留了变量、环境和当前目录，符合会话语义。比自行实现 shell grammar 可靠得多。命令本身拥有 root 权限，因此刻意伪造 framing 不构成额外权限提升。
+
+每个会话由独立 worker 持有进程和输入输出，队列串行执行命令；取消信号不依赖执行锁，因此无限时命令也可以被销毁、撤销或服务关闭中断。HTTP 调用方断开后，worker 仍消费完整响应，避免后续命令串包。服务关闭时拒绝新会话并取消全部已有会话，再等待 HTTP 请求退出。
+
+默认不设命令或会话运行时长上限，删除 `max_command_seconds` 配置；调用方仍可显式指定正整数 `timeout_seconds`。令牌有效期保持独立，只对授权及后续调用做检查。旧 Unix 默认 `shell = "pwsh"` 在加载配置时迁移为 `/bin/bash`，旧自定义路径需手动修改。
 
 ### 短期令牌
 
@@ -44,20 +50,21 @@ Master Password 只保存 Argon2id PHC verifier。TOTP 验证在数学上必须�
 
 | 原始需求 | 实现 |
 |---|---|
-| Windows Administrator / Linux root | 启动身份检查；SCM LocalSystem / systemd root |
+| Windows Administrator / Linux/macOS root | 启动身份检查；SCM LocalSystem / systemd root / launchd root |
 | 每次运行令牌自然失效 | opaque token 元数据只保存在进程内存中 |
 | 用户亲自签发 token | 本地 UI + Argon2id Master / TOTP |
 | 默认 24h、可永久 | issue API 和 UI presets |
 | 一个 token 一个 session | 双向 token-id/handle map，明确 reused 响应 |
 | handle 是强密码 | CSPRNG 256 bit base64url |
-| 完整 PowerShell 语义 | 持久化 `pwsh` 原生解析，跨平台集成测试 |
+| 平台原生 shell 语义 | 持久化 `pwsh` 或 Bash 原生解析，平台集成测试 |
 | 销毁 session/token | 立即移除映射并 kill shell；撤销级联 |
 | HTTP + MCP | Axum JSON API + MCP JSON-RPC Streamable HTTP |
-| Agent Skill 安全询问 | `skills/use-sudoserver` |
-| 两端二进制 CI | Windows/Linux matrix + release artifacts |
+| MCP shell 识别 | 平台相关说明与 enter 的 shell/platform 字段 |
+| 多平台二进制 CI | Windows/Linux/macOS ARM64 与 x86_64 matrix + release artifacts |
 
 ## 剩余工程边界
 
-- 当前输出为有上限的聚合响应，不支持 stdin 交互或实时流。需要长时间流式任务时应扩展 SSE/任务模型，而不是取消上限。
-- Windows 服务安装路径指向当前二进制；升级时应先停止服务并原子替换已安装位置。Linux 同理。
+- 当前输出为有大小上限的聚合响应，不支持 stdin 交互或实时流；长时间任务可运行至完成，但 HTTP/MCP 客户端可能有自己的超时。
+- Windows、Linux、macOS 服务安装路径均指向当前二进制；升级时应先停止服务并替换已安装位置。macOS 使用 `/Library/LaunchDaemons/dev.sudoserver.plist`，`bootstrap system` 安装，`bootout` 卸载；配置和 seal key 保留。
+- 取消会话终止 shell 主进程，不保证回收其全部子进程或主动分离的后台进程；这不是进程容器或作业调度器。
 - 审计日志有意不记录命令和 secret，避免产生第二份敏感数据。组织环境若需要审计，应设计带访问控制与脱敏策略的独立 sink。

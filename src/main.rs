@@ -1,11 +1,13 @@
 use std::{
     io::{self, BufRead},
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::Command,
 };
 
 #[cfg(target_os = "linux")]
 use std::fs;
+#[cfg(any(target_os = "linux", windows))]
+use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -16,6 +18,8 @@ use sudoserver::{
 };
 use zeroize::{Zeroize, Zeroizing};
 
+#[cfg(any(target_os = "macos", test))]
+mod launchd;
 #[cfg(windows)]
 mod windows_service_host;
 
@@ -175,8 +179,12 @@ where
     tracing::info!(bind = %config.bind, "runtime token store initialized");
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     println!("SudoServer management UI: http://{}/", config.bind);
-    axum::serve(listener, router(AppState::new(config, auth)))
-        .with_graceful_shutdown(shutdown)
+    let state = AppState::new(config, auth);
+    axum::serve(listener, router(state.clone()))
+        .with_graceful_shutdown(async move {
+            shutdown.await;
+            state.shutdown().await;
+        })
         .await?;
     Ok(())
 }
@@ -220,14 +228,17 @@ fn install(config_path: PathBuf) -> Result<()> {
     if !is_elevated()? {
         bail!("service installation requires Administrator/root");
     }
+    let config_path = config_path
+        .canonicalize()
+        .context("failed to resolve configuration path")?;
     Config::load(&config_path)?;
     let executable = std::env::current_exe()?;
     #[cfg(target_os = "linux")]
     install_systemd(&executable, &config_path)?;
     #[cfg(windows)]
     install_windows_service(&executable, &config_path)?;
-    #[cfg(not(any(target_os = "linux", windows)))]
-    bail!("automatic service installation is currently supported only on Windows and Linux");
+    #[cfg(target_os = "macos")]
+    launchd::install(&executable, &config_path)?;
     println!("SudoServer service installed and started.");
     Ok(())
 }
@@ -240,10 +251,8 @@ fn uninstall() -> Result<()> {
     let removed = uninstall_systemd()?;
     #[cfg(windows)]
     let removed = uninstall_windows_service()?;
-    #[cfg(not(any(target_os = "linux", windows)))]
-    let removed: bool = {
-        bail!("automatic service uninstallation is currently supported only on Windows and Linux")
-    };
+    #[cfg(target_os = "macos")]
+    let removed = launchd::uninstall()?;
 
     if removed {
         println!("SudoServer service stopped and uninstalled.");
@@ -257,7 +266,7 @@ fn uninstall() -> Result<()> {
 #[cfg(target_os = "linux")]
 fn install_systemd(executable: &Path, config: &Path) -> Result<()> {
     let unit = format!(
-        "[Unit]\nDescription=SudoServer privileged PowerShell broker\nAfter=network.target\n\n[Service]\nType=simple\nExecStart={} serve --config {}\nRestart=on-failure\nRestartSec=3\nNoNewPrivileges=false\n\n[Install]\nWantedBy=multi-user.target\n",
+        "[Unit]\nDescription=SudoServer privileged Bash broker\nAfter=network.target\n\n[Service]\nType=simple\nExecStart={} serve --config {}\nRestart=on-failure\nRestartSec=3\nNoNewPrivileges=false\n\n[Install]\nWantedBy=multi-user.target\n",
         systemd_escape(executable),
         systemd_escape(config)
     );

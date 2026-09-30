@@ -1,6 +1,6 @@
 # SudoServer
 
-> 让 AI 在确实需要时，方便、安全地执行管理员/root PowerShell，而不用和 Agent 沙箱反复斗智斗勇。
+> 让 AI 在确实需要时，方便、安全地执行管理员/root 命令：Windows 使用 PowerShell，Linux/macOS 使用 Bash。
 
 SudoServer 是主要面向 AI Agent 的本机提权通道。当必要的系统操作被 Agent 沙箱、权限限制或提权边界拦住时，Agent 可以通过 MCP 请求一段由用户明确授权的高权限会话，直接完成安装软件、修改系统配置、管理服务等工作。
 
@@ -16,7 +16,7 @@ SudoServer 提供一条简单、确定且失败关闭的路径：
 
 - **不和沙箱对抗**：需要高权限时直接走 SudoServer，不尝试 sandbox escape 或临时拼装提权技巧。
 - **用户掌握授权**：Agent 只向用户索要 SudoServer 令牌，永远不接触 Master Password 或 Authenticator 动态码。
-- **原生脚本体验**：命令交给真实的持久化 `pwsh`，而不是由服务自行解析或阉割 PowerShell 语法。
+- **原生脚本体验**：Windows 命令交给持久化 `pwsh`，Linux/macOS 命令交给持久化 `/bin/bash`，由原生 shell 解析。
 - **少打扰**：一个 token 自动复用一个会话，变量、工作目录和环境可以跨命令保持，不必每执行一步都重新授权。
 - **边界明确**：撤销 token 会终止它的会话；token 和 handle 校验出错只会拒绝执行，不会降级到不安全路径。
 
@@ -33,20 +33,22 @@ Agent 判断任务需要管理员/root 权限
 
 ## 核心能力
 
-- Windows 与 Linux 单一 Rust 二进制；服务启动时强制检查 Administrator/root 身份。
+- Windows、Linux 与 macOS 均提供独立 Rust 二进制；服务启动时强制检查 Administrator/root 身份。
 - 令牌是 22 位纯字母数字随机串，约 131 bit 熵；服务端只在内存中保存 SHA-256 哈希和授权元数据。
 - Master Password 使用 Argon2id 保存为不可逆 verifier；TOTP 使用 RFC 6238 SHA-1/6 位/30 秒配置，兼容 Proton Authenticator。
-- TOTP secret 以 AES-256-GCM 加密，seal key 与配置文件仅允许 SYSTEM/Administrators（Windows）或 owner（Linux）访问。
+- TOTP secret 以 AES-256-GCM 加密，seal key 与配置文件仅允许 SYSTEM/Administrators（Windows）或 owner（Linux/macOS）访问。
 - 默认令牌有效期 24 小时，支持自定义有效期与“永久”（仍随服务重启失效）。
 - 一个令牌最多拥有一个存活会话；重复进入会明确返回原 handle。handle 为 256 bit CSPRNG 随机值。
-- 命令直接交给持久化 `pwsh` 解析和执行，支持管道、通配符、多行、Unicode、环境变量、变量/目录跨调用保持和原生命令退出码。
+- 命令直接交给平台原生 shell 解析和执行，支持管道、通配符、多行、Unicode、环境变量、函数/变量/目录跨调用保持和原生命令退出码。
+- 会话没有独立的运行时间上限，命令默认无限时；调用方可选传 `timeout_seconds`，不设服务端最大值。令牌的授权有效期规则不变。
 - 撤销令牌会同时终止其全部会话；命令超时或执行器失联会销毁会话。
 - HTTP 和管理 UI 强制只绑定 loopback；敏感值只放 JSON body，不放 URL。
 
 ## 前置条件
 
-- Windows 10/11 或使用 systemd 的 Linux
-- [PowerShell 7 (`pwsh`)](https://learn.microsoft.com/powershell/scripting/install/installing-powershell)
+- Windows 10/11：安装 [PowerShell 7 (`pwsh`)](https://learn.microsoft.com/powershell/scripting/install/installing-powershell)
+- Linux：使用 `/bin/bash`，自动安装服务需要 systemd
+- macOS：使用系统 `/bin/bash`（兼容 Bash 3.2）和 launchd；支持 Apple Silicon 与 Intel
 - 从源码构建需要 Rust stable
 
 ## 构建与初始化
@@ -70,7 +72,16 @@ cargo build --release
 ./target/release/sudoserver install
 ```
 
-Windows 注册为 `SudoServer` 自启动服务并以 LocalSystem 运行；Linux 写入并启用 `sudoserver.service`。若初始化和安装使用不同账户，请在两条命令中都传入同一个绝对配置路径：`--config <path>`。
+Windows 注册为 `SudoServer` 自启动服务并以 LocalSystem 运行；Linux 写入并启用 `sudoserver.service`；macOS 写入 `/Library/LaunchDaemons/dev.sudoserver.plist`，通过 launchd 以 root 自动运行。若初始化和安装使用不同账户，请在两条命令中都传入同一个绝对配置路径：`--config <path>`。二进制应放在稳定路径中，安装后不要移动它。
+
+macOS 安装示例（先把二进制放到 `/usr/local/bin/sudoserver`）：
+
+```bash
+sudo /usr/local/bin/sudoserver init --config /Library/SudoServer/config.toml --totp
+sudo /usr/local/bin/sudoserver install --config /Library/SudoServer/config.toml
+# 查看服务状态
+sudo launchctl print system/dev.sudoserver
+```
 
 卸载系统服务需要 Administrator/root 权限。该操作会停止并注销服务，但保留配置文件和 `seal.key`：
 
@@ -106,13 +117,7 @@ http://127.0.0.1:32119/mcp
 
 具体配置文件位置取决于所使用的 Agent。连接成功后应能看到 `sudo_enter`、`sudo_run`、`sudo_destroy_session` 和 `sudo_revoke_token` 四个工具。
 
-同时将 [skills/use-sudoserver](skills/use-sudoserver/SKILL.md) 安装到 Agent 的 skills 目录。这个 Skill 告诉 Agent：
-
-- 权限不足时优先使用 SudoServer，不要和沙箱反复周旋。
-- 优先通过 Ask/user-input 工具向用户索要 SudoServer 令牌。
-- 索要授权时展示 sudo 的三条警示，让用户理解自己正在授予什么能力。
-- 绝不索要、接收或尝试发现 Master Password/TOTP。
-- 完成工作后销毁会话，并在不再需要时撤销令牌。
+MCP 工具说明会明确当前平台和 shell。Agent 应按 `sudo_enter` 返回的 `shell`、`platform` 使用对应语法；Windows PowerShell 脚本不能直接用于 Linux/macOS Bash 会话。
 
 ## API 概览
 
@@ -121,7 +126,7 @@ http://127.0.0.1:32119/mcp
 | 路径 | 请求核心字段 | 用途 |
 |---|---|---|
 | `/v1/sessions/enter` | `token` | 建立或复用令牌的会话 |
-| `/v1/commands/run` | `handle`, `command` | 在持久化 PowerShell 中执行 |
+| `/v1/commands/run` | `handle`, `command` | 在持久化 PowerShell/Bash 中执行 |
 | `/v1/sessions/destroy` | `handle` | 终止会话 |
 | `/v1/tokens/revoke` | `token` | 撤销令牌并终止会话 |
 | `/v1/admin/tokens/issue` | `credential`, duration | 签发令牌 |
@@ -134,10 +139,11 @@ http://127.0.0.1:32119/mcp
 
 ```toml
 bind = "127.0.0.1:32119"
-shell = "pwsh"
+shell = "pwsh" # Windows；Linux/macOS 默认为 "/bin/bash"
 max_output_bytes = 8388608
-max_command_seconds = 300
 ```
+
+`shell` 可使用本平台 shell 的完整路径，但不支持跨 shell 切换。旧配置中的 `max_command_seconds` 被忽略，新配置不再生成该字段。Linux/macOS 的旧默认 `shell = "pwsh"` 会在加载时迁移为 `/bin/bash` 并记录提示，不改写原文件；旧自定义 PowerShell 路径需手动改为 Bash 路径。
 
 非 loopback 地址会被拒绝。若确实需要跨主机使用，应另行设计带双向认证和 TLS 的传输层；不要简单转发本端口。
 
@@ -145,8 +151,9 @@ max_command_seconds = 300
 
 - 信任边界与原始需求一致：正确提供 Master Password/TOTP 的主体视为用户本人；正确提供 token/handle 的主体拥有相应运行期权限。
 - 管理凭据不会写入日志或明文存储，但会在验证时短暂存在于服务内存。拥有本机 root/Administrator 的攻击者本来就位于本组件保护边界之外，也能读取进程或 seal key。
-- PowerShell 以 `-NoProfile -NonInteractive` 启动，继承系统服务的环境和执行身份；它不会继承某个桌面用户的交互式 profile。需要用户目录/网络凭据时必须在授权命令中显式处理。
-- 命令输出先由 PowerShell 汇总再返回，不是流式接口；超过 `max_output_bytes` 会截断。超时会杀死 PowerShell 主进程，但命令主动分离出的后台进程可能继续运行。
+- PowerShell 使用 `-NoProfile -NonInteractive`；Bash 使用 `--noprofile --norc`，同时移除 `BASH_ENV` 等启动注入变量。二者继承系统服务身份和环境，不加载桌面用户 profile。
+- 响应在命令完成后返回，不是流式接口；超过 `max_output_bytes` 会截断并继续排空输出，保证后续命令不串包。命令默认无限时，但销毁会话、撤销令牌和服务关闭可中断正在执行的命令。终止 shell 不保证终止其子进程或主动分离的后台进程。
+- 会话非交互式，不支持终端输入；Bash 命令的 stdin 为 `/dev/null`。`exit`、`exec` 或导致 shell 退出的选项（例如 Bash `set -e` 后失败）可能结束会话。令牌过期会阻止后续调用，不额外为已启动的命令添加计时器。
 - 本项目不声称抵抗已经取得本机高权限的恶意软件，也不替代操作系统审计、备份和最小权限策略。
 
 更详细的可行性与设计取舍见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
@@ -159,9 +166,9 @@ cargo clippy --all-targets -- -D warnings
 cargo test --all-targets
 ```
 
-集成测试会调用本机 `pwsh` 验证管道、通配符、多行、Unicode、错误流、原生命令退出码、状态继承，以及完整 HTTP 签发/复用/执行/撤销生命周期。CI 在 Windows 和 Linux 上运行相同测试并产出 release 二进制。
+集成测试调用本平台 shell，验证管道、通配符、多行、Unicode、错误流、退出码、状态继承、截断后同步、可选超时、无限时命令取消，以及 HTTP 签发/复用/执行/撤销生命周期。所需 shell 缺失会让测试失败。CI 覆盖 Windows x86_64、Linux x86_64、macOS Apple Silicon 和 Intel，macOS 使用系统 Bash 3.2。
 
-`main` 分支上的 push 触发 `CI` 后，只有 Windows 和 Linux 两端全部测试、构建并上传成品成功，`Release Candidate` 才会接续运行。它直接下载该次 CI 的两端成品（不重复构建），打包、生成 `SHA256SUMS`，并以 `v<项目版本>-rc.<CI序号>.<重试序号>` 创建 GitHub prerelease。PR 检查不会发布 RC；正式版 `Release` 工作流也明确排除 `-rc.*` tag。
+`main` 分支 push 触发 `CI` 后，只有全部平台测试、构建并上传成品成功，`Release Candidate` 才会接续运行。它按平台分别下载该次 CI 成品（不重复构建），打包为 Windows ZIP、Linux/macOS tar.gz，生成 `SHA256SUMS`，并以 `v<项目版本>-rc.<CI序号>.<重试序号>` 创建 GitHub prerelease。PR 检查不会发布 RC；正式版 `Release` 工作流也明确排除 `-rc.*` tag。
 
 ## License
 

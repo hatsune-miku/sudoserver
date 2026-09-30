@@ -27,32 +27,35 @@ jobs:
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
 
-      - name: Download Windows and Linux artifacts from CI
+      - name: Download all platform artifacts from CI
         uses: actions/download-artifact@v4
         with:
           pattern: sudoserver-*
           path: binaries
-          merge-multiple: true
+          merge-multiple: false
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ github.token }}
 
-      - name: Verify and package both platforms
+      - name: Verify and package all platforms
         shell: bash
         run: |
-          windows_binary="$(find binaries -type f -name 'sudoserver.exe' -print -quit)"
-          linux_binary="$(find binaries -type f -name 'sudoserver' -print -quit)"
-          test -n "$windows_binary" || { echo 'Windows artifact is missing' >&2; exit 1; }
-          test -n "$linux_binary" || { echo 'Linux artifact is missing' >&2; exit 1; }
-
-          mkdir -p packages/SudoServer-windows-x86_64 packages/SudoServer-linux-x86_64 assets
-          cp "$windows_binary" packages/SudoServer-windows-x86_64/
-          cp "$linux_binary" packages/SudoServer-linux-x86_64/
-          chmod +x packages/SudoServer-linux-x86_64/sudoserver
-          cp README.md LICENSE-MIT packages/SudoServer-windows-x86_64/
-          cp README.md LICENSE-MIT packages/SudoServer-linux-x86_64/
-
-          (cd packages && zip -qr ../assets/sudoserver-windows-x86_64.zip SudoServer-windows-x86_64)
-          tar -czf assets/sudoserver-linux-x86_64.tar.gz -C packages SudoServer-linux-x86_64
+          mkdir -p assets
+          for platform in windows-x86_64 linux-x86_64 macos-aarch64 macos-x86_64; do
+            binary=sudoserver
+            if [[ "$platform" == windows-* ]]; then binary=sudoserver.exe; fi
+            source="binaries/sudoserver-$platform/$binary"
+            test -f "$source" || { echo "$platform artifact is missing" >&2; exit 1; }
+            package="SudoServer-$platform"
+            mkdir -p "packages/$package"
+            cp "$source" "packages/$package/"
+            cp README.md LICENSE-MIT "packages/$package/"
+            if [[ "$platform" == windows-* ]]; then
+              (cd packages && zip -qr "../assets/sudoserver-$platform.zip" "$package")
+            else
+              chmod +x "packages/$package/sudoserver"
+              tar -czf "assets/sudoserver-$platform.tar.gz" -C packages "$package"
+            fi
+          done
           (cd assets && sha256sum sudoserver-* > SHA256SUMS)
 
       - name: Derive release candidate version

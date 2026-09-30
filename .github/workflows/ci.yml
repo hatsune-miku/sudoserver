@@ -9,7 +9,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest]
+        include:
+          - os: windows-latest
+            platform: windows-x86_64
+          - os: ubuntu-latest
+            platform: linux-x86_64
+          - os: macos-15
+            platform: macos-aarch64
+          - os: macos-15-intel
+            platform: macos-x86_64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -27,15 +35,20 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-cargo-
       - name: Verify PowerShell
+        if: runner.os == 'Windows'
         shell: pwsh
         run: $PSVersionTable.PSVersion
+      - name: Verify system Bash
+        if: runner.os != 'Windows'
+        shell: bash
+        run: /bin/bash --version
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all-targets
       - run: cargo build --release
       - uses: actions/upload-artifact@v4
         with:
-          name: sudoserver-${{ runner.os }}-${{ runner.arch }}
+          name: sudoserver-${{ matrix.platform }}
           path: |
             target/release/sudoserver
             target/release/sudoserver.exe

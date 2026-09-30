@@ -21,6 +21,12 @@ jobs:
           - os: ubuntu-latest
             artifact: sudoserver-linux-x86_64
             binary: target/release/sudoserver
+          - os: macos-15
+            artifact: sudoserver-macos-aarch64
+            binary: target/release/sudoserver
+          - os: macos-15-intel
+            artifact: sudoserver-macos-x86_64
+            binary: target/release/sudoserver
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -38,8 +44,8 @@ jobs:
       - run: cargo test --all-targets
       - run: cargo build --release
       - name: Stage binary
-        shell: pwsh
-        run: Copy-Item '${{ matrix.binary }}' '${{ matrix.artifact }}'
+        shell: bash
+        run: cp '${{ matrix.binary }}' '${{ matrix.artifact }}'
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}

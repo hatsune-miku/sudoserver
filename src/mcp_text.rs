@@ -1,8 +1,18 @@
 use serde_json::{Value, json};
 
-pub const SERVER_INSTRUCTIONS: &str = "SudoServer runs locally and provides arbitrary code execution with root (Linux) or `NT AUTHORITY\\SYSTEM` (Windows) privileges. Suggest it to the user when you may need it, and let them decide if they want to use it.";
+pub const SERVER_INSTRUCTIONS: &str = "SudoServer runs locally and provides arbitrary code execution with root (Linux/macOS) or `NT AUTHORITY\\SYSTEM` (Windows) privileges. Suggest it to the user when you may need it, and let them decide if they want to use it.";
 pub const MISSING_TOOL_NAME: &str = "missing tool name";
 pub const SERIALIZATION_FAILED: &str = "serialization failed";
+pub const INVALID_TIMEOUT: &str =
+    "timeout_seconds must be a positive integer or null; omit it for unlimited execution";
+
+pub fn server_instructions() -> String {
+    format!(
+        "{SERVER_INSTRUCTIONS} This server uses {} on {}; use that shell's syntax. Commands have no default execution timeout.",
+        crate::shell::ShellKind::native().name(),
+        std::env::consts::OS
+    )
+}
 
 pub fn unknown_method(method: &str) -> String {
     format!("unknown MCP method: {method}")
@@ -17,11 +27,12 @@ pub fn missing_string_argument(name: &str) -> String {
 }
 
 pub fn tool_definitions() -> Value {
+    let shell = crate::shell::ShellKind::native().name();
     json!([
         {
             "name": "sudo_enter",
-            "title": "Enter privileged PowerShell session",
-            "description": "Enter an administrator/root PowerShell session using a short-lived SudoServer token personally issued by the user. If this token already owns a live session, the existing strong-password handle is returned and reused; otherwise a new session is created.",
+            "title": format!("Enter privileged {shell} session"),
+            "description": format!("Enter an administrator/root {shell} session using a short-lived SudoServer token personally issued by the user. If this token already owns a live session, the existing strong-password handle is returned and reused; otherwise a new session is created. The response identifies the shell and platform."),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -40,8 +51,8 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "sudo_run",
-            "title": "Run privileged PowerShell script and get raw output",
-            "description": "Run the command verbatim in the persistent privileged PowerShell session. PowerShell itself parses pipelines, wildcards, multiline scripts and environment variables. State, current directory and environment persist between calls. Output streams are merged in PowerShell order.",
+            "title": format!("Run privileged {shell} script and get raw output"),
+            "description": format!("Run the command verbatim in the persistent privileged {shell} session. {shell} itself parses pipelines, wildcards, multiline scripts and environment variables. State, current directory and environment persist between calls. Output streams are merged. Execution has no default timeout; optionally supply timeout_seconds. Commands are noninteractive; exit or exec can end the session."),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -51,12 +62,12 @@ pub fn tool_definitions() -> Value {
                     },
                     "command": {
                         "type": "string",
-                        "description": "PowerShell source code passed verbatim to PowerShell's parser"
+                        "description": format!("{shell} source code passed verbatim to {shell}'s parser")
                     },
                     "timeout_seconds": {
-                        "type": "integer",
+                        "type": ["integer", "null"],
                         "minimum": 1,
-                        "description": "Optional command timeout in seconds"
+                        "description": "Optional positive command timeout in seconds, without a server-imposed maximum. Omit or pass null for unlimited execution. A timeout destroys the session."
                     }
                 },
                 "required": ["handle", "command"],
@@ -66,7 +77,7 @@ pub fn tool_definitions() -> Value {
         {
             "name": "sudo_destroy_session",
             "title": "Destroy privileged session",
-            "description": "Immediately terminate a privileged PowerShell session and invalidate its handle.",
+            "description": "Immediately terminate a privileged shell session and invalidate its handle.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

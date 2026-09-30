@@ -4,8 +4,8 @@ use serde_json::{Value, json};
 
 use crate::{
     mcp_text::{
-        MISSING_TOOL_NAME, SERIALIZATION_FAILED, SERVER_INSTRUCTIONS, missing_string_argument,
-        tool_definitions, unknown_method, unknown_tool,
+        INVALID_TIMEOUT, MISSING_TOOL_NAME, SERIALIZATION_FAILED, missing_string_argument,
+        server_instructions, tool_definitions, unknown_method, unknown_tool,
     },
     server::{ApiError, AppState},
 };
@@ -45,7 +45,7 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
             "protocolVersion": "2025-06-18",
             "capabilities": { "tools": { "listChanged": false } },
             "serverInfo": { "name": "SudoServer", "version": env!("CARGO_PKG_VERSION") },
-            "instructions": SERVER_INSTRUCTIONS
+            "instructions": server_instructions()
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({ "tools": tool_definitions() })),
@@ -82,7 +82,7 @@ async fn call_tool(state: &AppState, params: Value) -> Result<Value, ApiError> {
         "sudo_run" => {
             let handle = string_arg(&arguments, "handle")?;
             let command = string_arg(&arguments, "command")?;
-            let timeout = arguments.get("timeout_seconds").and_then(Value::as_u64);
+            let timeout = timeout_arg(&arguments)?;
             let result = state.run(handle, command, timeout).await?;
             tool_json(
                 serde_json::to_value(result)
@@ -110,6 +110,17 @@ fn string_arg<'a>(arguments: &'a Value, name: &str) -> Result<&'a str, ApiError>
         .ok_or_else(|| ApiError::bad_request(missing_string_argument(name)))
 }
 
+fn timeout_arg(arguments: &Value) -> Result<Option<u64>, ApiError> {
+    match arguments.get("timeout_seconds") {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .filter(|seconds| *seconds > 0)
+            .map(Some)
+            .ok_or_else(|| ApiError::bad_request(INVALID_TIMEOUT)),
+    }
+}
+
 fn tool_json(value: Value) -> Result<Value, ApiError> {
     Ok(json!({
         "content": [{ "type": "text", "text": serde_json::to_string_pretty(&value).unwrap_or_default() }],
@@ -134,8 +145,23 @@ mod tests {
         ] {
             assert!(text.contains(tool));
         }
-        assert!(SERVER_INSTRUCTIONS.contains("arbitrary code execution"));
+        assert!(server_instructions().contains("arbitrary code execution"));
+        assert!(server_instructions().contains(crate::shell::ShellKind::native().name()));
         assert!(text.contains("With great power comes great responsibility"));
         assert!(text.contains("reused"));
+    }
+
+    #[test]
+    fn validates_optional_unbounded_timeout() {
+        for value in [json!({}), json!({"timeout_seconds": null})] {
+            assert_eq!(timeout_arg(&value).unwrap(), None);
+        }
+        assert_eq!(
+            timeout_arg(&json!({"timeout_seconds": 3600})).unwrap(),
+            Some(3600)
+        );
+        for value in [json!(0), json!(-1), json!(1.5), json!("10"), json!(true)] {
+            assert!(timeout_arg(&json!({"timeout_seconds": value})).is_err());
+        }
     }
 }

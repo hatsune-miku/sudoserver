@@ -15,7 +15,7 @@ use crate::{
     auth::{AuthError, AuthManager, Credential, DEFAULT_TOKEN_TTL_SECONDS, TokenRecord},
     config::Config,
     mcp,
-    shell::{ExecutionResult, PowerShell, ShellError},
+    shell::{ExecutionResult, Shell, ShellError, ShellKind},
 };
 
 #[derive(Clone)]
@@ -28,11 +28,12 @@ pub struct AppState {
 struct Session {
     token_id: String,
     expires_at: Option<i64>,
-    shell: Arc<Mutex<PowerShell>>,
+    shell: Arc<Shell>,
 }
 
 #[derive(Default)]
 struct SessionStore {
+    shutting_down: bool,
     by_handle: HashMap<String, Session>,
     by_token: HashMap<String, String>,
 }
@@ -41,6 +42,8 @@ struct SessionStore {
 pub struct EnterResult {
     pub handle: String,
     pub reused: bool,
+    pub shell: ShellKind,
+    pub platform: &'static str,
     pub message: String,
 }
 
@@ -114,18 +117,30 @@ impl AppState {
     }
 
     pub async fn enter(&self, token: &str) -> Result<EnterResult, ApiError> {
-        let authorization = self.auth.lock().await.verify_token(token)?;
+        // Keep authorization and insertion atomic with respect to token revocation.
+        let auth = self.auth.lock().await;
+        let authorization = auth.verify_token(token)?;
         let mut sessions = self.sessions.lock().await;
-        if let Some(handle) = sessions.by_token.get(&authorization.id).cloned()
-            && sessions.by_handle.contains_key(&handle)
-        {
-            return Ok(EnterResult {
-                handle,
-                reused: true,
-                message: "Reused the token's existing privileged session.".into(),
-            });
+        if sessions.shutting_down {
+            return Err(ApiError::internal("server is shutting down"));
         }
-        let shell = PowerShell::spawn(&self.config.shell, self.config.max_output_bytes).await?;
+        if let Some(handle) = sessions.by_token.get(&authorization.id).cloned() {
+            if sessions
+                .by_handle
+                .get(&handle)
+                .is_some_and(|session| !session.shell.is_finished())
+            {
+                return Ok(EnterResult {
+                    handle,
+                    reused: true,
+                    shell: ShellKind::native(),
+                    platform: std::env::consts::OS,
+                    message: "Reused the token's existing privileged session.".into(),
+                });
+            }
+            remove_session(&mut sessions, &handle);
+        }
+        let shell = Shell::spawn(&self.config.shell, self.config.max_output_bytes).await?;
         let handle = strong_handle();
         sessions
             .by_token
@@ -135,14 +150,18 @@ impl AppState {
             Session {
                 token_id: authorization.id,
                 expires_at: authorization.expires_at,
-                shell: Arc::new(Mutex::new(shell)),
+                shell: Arc::new(shell),
             },
         );
         Ok(EnterResult {
             handle,
             reused: false,
-            message: "Created a new privileged PowerShell session. Treat the handle as a password."
-                .into(),
+            shell: ShellKind::native(),
+            platform: std::env::consts::OS,
+            message: format!(
+                "Created a new privileged {} session. Treat the handle as a password.",
+                ShellKind::native().name()
+            ),
         })
     }
 
@@ -152,12 +171,10 @@ impl AppState {
         command: &str,
         requested_timeout: Option<u64>,
     ) -> Result<ExecutionResult, ApiError> {
-        let timeout = requested_timeout.unwrap_or(self.config.max_command_seconds);
-        if timeout == 0 || timeout > self.config.max_command_seconds {
-            return Err(ApiError::bad_request(format!(
-                "timeout_seconds must be between 1 and {}",
-                self.config.max_command_seconds
-            )));
+        if requested_timeout == Some(0) {
+            return Err(ApiError::bad_request(
+                "timeout_seconds must be greater than zero",
+            ));
         }
         let shell = {
             let mut sessions = self.sessions.lock().await;
@@ -176,7 +193,7 @@ impl AppState {
                 .map(|session| Arc::clone(&session.shell))
                 .ok_or_else(|| ApiError::from(AuthError::InvalidCredential))?
         };
-        let result = shell.lock().await.execute(command, timeout).await;
+        let result = shell.execute(command, requested_timeout).await;
         if result.is_err() {
             let mut sessions = self.sessions.lock().await;
             remove_session(&mut sessions, handle);
@@ -190,7 +207,7 @@ impl AppState {
             remove_session(&mut sessions, handle)
                 .ok_or_else(|| ApiError::from(AuthError::InvalidCredential))?
         };
-        shell.lock().await.terminate().await;
+        shell.terminate().await;
         Ok(())
     }
 
@@ -220,7 +237,26 @@ impl AppState {
                 .collect::<Vec<_>>()
         };
         for shell in shells {
-            shell.lock().await.terminate().await;
+            shell.terminate().await;
+        }
+    }
+
+    pub async fn shutdown(&self) {
+        let shells = {
+            let mut sessions = self.sessions.lock().await;
+            sessions.shutting_down = true;
+            sessions.by_token.clear();
+            sessions
+                .by_handle
+                .drain()
+                .map(|(_, session)| {
+                    session.shell.cancel();
+                    session.shell
+                })
+                .collect::<Vec<_>>()
+        };
+        for shell in shells {
+            shell.terminate().await;
         }
     }
 
@@ -230,9 +266,10 @@ impl AppState {
     }
 }
 
-fn remove_session(store: &mut SessionStore, handle: &str) -> Option<Arc<Mutex<PowerShell>>> {
+fn remove_session(store: &mut SessionStore, handle: &str) -> Option<Arc<Shell>> {
     let session = store.by_handle.remove(handle)?;
     store.by_token.remove(&session.token_id);
+    session.shell.cancel();
     Some(session.shell)
 }
 
@@ -422,7 +459,6 @@ mod tests {
     fn test_app() -> Router {
         let config = Config {
             password_hash: hash_password(b"test master password").unwrap(),
-            max_command_seconds: 10,
             ..Config::default()
         };
         let auth = AuthManager::new(config.password_hash.clone(), None);
@@ -431,9 +467,6 @@ mod tests {
 
     #[tokio::test]
     async fn full_http_lifecycle_reuses_session_and_revokes_access() {
-        if PowerShell::spawn("pwsh", 1024).await.is_err() {
-            return;
-        }
         let app = test_app();
         let credential = json!({ "type": "password", "value": "test master password" });
         let (status, issued) = request(
@@ -452,13 +485,18 @@ mod tests {
         assert_eq!(first["handle"], second["handle"]);
         assert_eq!(first["reused"], false);
         assert_eq!(second["reused"], true);
+        assert_eq!(
+            first["shell"],
+            serde_json::to_value(ShellKind::native()).unwrap()
+        );
+        assert_eq!(first["platform"], std::env::consts::OS);
         assert!(first["handle"].as_str().unwrap().len() >= 40);
 
         let handle = first["handle"].as_str().unwrap();
         let (status, result) = request(
             &app,
             "/v1/commands/run",
-            json!({ "handle": handle, "command": "$global:httpState=40+2; $global:httpState" }),
+            json!({ "handle": handle, "command": if cfg!(windows) { "$global:httpState=40+2; $global:httpState" } else { "httpState=$((40+2)); echo $httpState" } }),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -525,5 +563,84 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let (status, _) = request(&app, "/v1/sessions/enter", json!({ "token": token })).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn destroy_revoke_and_shutdown_interrupt_unlimited_commands() {
+        for action in ["destroy", "revoke", "shutdown"] {
+            let config = Config::default();
+            let mut auth = AuthManager::new("unused".into(), None);
+            let (token, _) = auth.issue_token(None).unwrap();
+            let state = AppState::new(config, auth);
+            let entered = state.enter(&token).await.unwrap();
+            state
+                .run(&entered.handle, "echo ready", Some(3600))
+                .await
+                .unwrap();
+            assert!(
+                state
+                    .run(&entered.handle, "echo invalid", Some(0))
+                    .await
+                    .is_err()
+            );
+            let executing = {
+                let state = state.clone();
+                let handle = entered.handle.clone();
+                tokio::spawn(async move {
+                    state
+                        .run(
+                            &handle,
+                            if cfg!(windows) {
+                                "while ($true) { Start-Sleep -Milliseconds 100 }"
+                            } else {
+                                "while :; do :; done"
+                            },
+                            None,
+                        )
+                        .await
+                })
+            };
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                match action {
+                    "destroy" => state.destroy_session(&entered.handle).await.unwrap(),
+                    "revoke" => state.revoke_token(&token).await.unwrap(),
+                    _ => state.shutdown().await,
+                }
+            })
+            .await
+            .expect("cancellation waited for unlimited command");
+            assert!(executing.await.unwrap().is_err());
+            assert!(
+                state
+                    .run(&entered.handle, "echo never", None)
+                    .await
+                    .is_err()
+            );
+            if action == "destroy" {
+                let recreated = state.enter(&token).await.unwrap();
+                assert!(!recreated.reused);
+                assert_ne!(recreated.handle, entered.handle);
+                state.shutdown().await;
+            } else {
+                assert!(state.enter(&token).await.is_err());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn enter_replaces_session_that_ended_after_caller_disconnected() {
+        let mut auth = AuthManager::new("unused".into(), None);
+        let (token, _) = auth.issue_token(None).unwrap();
+        let state = AppState::new(Config::default(), auth);
+        let first = state.enter(&token).await.unwrap();
+        // Simulate a worker ending after its HTTP caller was dropped, so the
+        // request handler cannot remove the session mapping itself.
+        let shell = Arc::clone(&state.sessions.lock().await.by_handle[&first.handle].shell);
+        shell.terminate().await;
+        let second = state.enter(&token).await.unwrap();
+        assert!(!second.reused);
+        assert_ne!(first.handle, second.handle);
+        state.shutdown().await;
     }
 }

@@ -2,7 +2,7 @@
 name = "sudoserver"
 version = "0.1.0"
 edition = "2024"
-description = "User-controlled, short-lived privileged PowerShell sessions over HTTP and MCP"
+description = "User-controlled privileged PowerShell and Bash sessions over HTTP and MCP"
 license = "MIT"
 
 [dependencies]

@@ -24,7 +24,6 @@ pub struct Config {
     pub totp_secret: Option<SealedSecret>,
     pub shell: String,
     pub max_output_bytes: usize,
-    pub max_command_seconds: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -39,9 +38,8 @@ impl Default for Config {
             bind: SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), DEFAULT_PORT),
             password_hash: String::new(),
             totp_secret: None,
-            shell: "pwsh".to_owned(),
+            shell: crate::shell::ShellKind::native().executable().to_owned(),
             max_output_bytes: 8 * 1024 * 1024,
-            max_command_seconds: 300,
         }
     }
 }
@@ -50,7 +48,8 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let text = fs::read_to_string(path)
             .with_context(|| format!("failed to read configuration {}", path.display()))?;
-        let config: Self = toml::from_str(&text).context("invalid configuration")?;
+        let mut config: Self = toml::from_str(&text).context("invalid configuration")?;
+        config.migrate_legacy_shell();
         config.validate()?;
         Ok(config)
     }
@@ -80,10 +79,33 @@ impl Config {
         if self.max_output_bytes < 1024 {
             bail!("max_output_bytes must be at least 1024");
         }
-        if self.max_command_seconds == 0 {
-            bail!("max_command_seconds must be greater than zero");
+        let executable = Path::new(&self.shell)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        let valid = if cfg!(windows) {
+            executable.eq_ignore_ascii_case("pwsh") || executable.eq_ignore_ascii_case("pwsh.exe")
+        } else {
+            executable == "bash"
+        };
+        if !valid {
+            bail!(
+                "shell must name {} or its full executable path on this platform",
+                crate::shell::ShellKind::native().executable()
+            );
         }
         Ok(())
+    }
+
+    fn migrate_legacy_shell(&mut self) {
+        // Old releases used PowerShell on every platform. Preserve the file and
+        // migrate its effective shell in memory; obsolete timeout keys are ignored.
+        if !cfg!(windows) && self.shell == "pwsh" {
+            self.shell = "/bin/bash".into();
+            tracing::warn!(
+                "legacy shell=pwsh configuration migrated to /bin/bash; save the configuration to make this explicit"
+            );
+        }
     }
 }
 
@@ -202,6 +224,31 @@ fn restrict_windows_acl(path: &Path, directory: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_timeout_is_ignored_and_shell_is_platform_native() {
+        let mut config: Config =
+            toml::from_str("password_hash = 'hash'\nshell = 'pwsh'\nmax_command_seconds = 300")
+                .unwrap();
+        config.migrate_legacy_shell();
+        config.validate().unwrap();
+        assert_eq!(config.shell, crate::shell::ShellKind::native().executable());
+        assert!(
+            !toml::to_string(&config)
+                .unwrap()
+                .contains("max_command_seconds")
+        );
+    }
+
+    #[test]
+    fn rejects_wrong_shell_backend() {
+        let config = Config {
+            password_hash: "hash".into(),
+            shell: if cfg!(windows) { "bash" } else { "powershell" }.into(),
+            ..Config::default()
+        };
+        assert!(config.validate().is_err());
+    }
 
     #[test]
     fn sealed_secret_round_trip_and_wrong_key_fails() {

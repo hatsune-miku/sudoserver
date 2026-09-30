@@ -13,7 +13,7 @@ Content-Type: application/json
 {"token":"<SUDOSERVER_TOKEN>"}
 ```
 
-返回 `{ "handle": "...", "reused": false, "message": "..." }`。同一 token 存在会话时，`reused` 为 `true` 且 handle 不变。
+返回 `{ "handle": "...", "reused": false, "shell": "powershell", "platform": "windows", "message": "..." }`。Linux/macOS 返回 `shell: "bash"`，`platform` 分别为 `"linux"` / `"macos"`。同一 token 存在会话时，`reused` 为 `true` 且 handle 不变。
 
 执行命令：
 
@@ -30,7 +30,13 @@ Content-Type: application/json
 {"output":"...","exit_code":0,"success":true,"truncated":false}
 ```
 
-PowerShell 的 success/error/warning/verbose/debug/information 流按 PowerShell 的 `*>&1` 顺序合并为文本。`exit_code` 优先采用原生进程的 `$LASTEXITCODE`；非终止 PowerShell 错误返回 1。
+示例命令使用 Windows PowerShell 语法。Linux/macOS 应使用 Bash，例如 `ps -eo pid,comm | head -n 6`。
+
+`timeout_seconds` 省略或为 `null` 时，命令没有执行时间上限；显式传入时必须是正整数，不受原先 300 秒的限制。超时会销毁会话。令牌有效期是独立的授权规则：过期后禁止后续调用，不为执行中的命令增加截止时间。
+
+PowerShell 的 success/error/warning/verbose/debug/information 流通过 `*>&1` 合并为文本。`exit_code` 优先采用原生进程的 `$LASTEXITCODE`；非终止 PowerShell 错误返回 1。Bash 合并 stdout/stderr，返回最后一条命令的退出码（管道遵从当前 `pipefail` 设置）。返回的文本最多保留 `max_output_bytes` 字节，非 UTF-8 字节以替换字符解码。
+
+同一会话的命令串行执行，变量、函数、环境和目录持续保留；调用方断开连接不会遗弃未读响应或自动取消执行。销毁会话、撤销令牌及服务关闭均可取消正在执行及排队中的命令。命令不支持交互 stdin；Bash stdin 为 `/dev/null`。`exit`、`exec` 等导致 shell 退出的操作会使会话失效。
 
 销毁会话：`POST /v1/sessions/destroy`，body 为 `{ "handle": "<HANDLE>" }`。
 
@@ -66,4 +72,4 @@ Master/TOTP 失败在每个进程实例内限制为 5 次/分钟；成功验证�
 - `tools/list`
 - `tools/call`
 
-工具为 `sudo_enter`、`sudo_run`、`sudo_destroy_session`、`sudo_revoke_token`。工具的 input schema 与普通授权接口字段一致。服务无 MCP transport session 状态；权限会话由强随机 handle 标识。
+工具为 `sudo_enter`、`sudo_run`、`sudo_destroy_session`、`sudo_revoke_token`。工具说明和 `initialize.instructions` 根据当前平台展示 PowerShell 或 Bash。字段与普通授权接口对应，但 MCP 的 `sudo_enter` 还要求阅读工具说明后传入 `confirm_text: "OK"`。服务无 MCP transport session 状态；权限会话由强随机 handle 标识。
