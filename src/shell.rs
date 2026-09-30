@@ -220,6 +220,8 @@ impl Process {
             }
         }
         let mut child = command
+            // An updater must run outside the service's own process tree.
+            .env("SUDOSERVER_SESSION", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -262,23 +264,7 @@ impl Process {
         let marker = STANDARD.encode(random);
         let encoded = match self.kind {
             ShellKind::PowerShell => STANDARD.encode(command.as_bytes()),
-            ShellKind::Bash => {
-                // Reconstructed by `printf %b`. Printable ASCII (except backslash,
-                // which `%b` would treat as an escape) passes through verbatim;
-                // everything else, including newlines, `|`, and non-ASCII bytes,
-                // is octal-escaped so the transport line stays single-line and
-                // unambiguous. This keeps ASCII-heavy commands roughly a quarter
-                // of the previous size without adding an external decoder.
-                let mut encoded = String::with_capacity(command.len());
-                for byte in command.bytes() {
-                    if (0x20..=0x7e).contains(&byte) && byte != b'\\' {
-                        encoded.push(byte as char);
-                    } else {
-                        write!(&mut encoded, "\\{byte:03o}").unwrap();
-                    }
-                }
-                encoded
-            }
+            ShellKind::Bash => encode_bash_command(command),
         };
         self.stdin
             .write_all(format!("{marker}|{encoded}\n").as_bytes())
@@ -381,7 +367,7 @@ impl Process {
     }
     async fn shell_exit_code(&mut self) -> i32 {
         match self.child.wait().await {
-            Ok(status) => status.code().unwrap_or_else(|| {
+            Ok(status) => status.code().unwrap_or({
                 #[cfg(unix)]
                 {
                     use std::os::unix::process::ExitStatusExt;
@@ -417,6 +403,21 @@ enum Fill {
     Data,
     ShellExited,
 }
+
+/// Reconstructed by Bash's `printf %b`. Escape both the decoding escape character
+/// and the `read` field separator: an unescaped trailing `|` would be discarded.
+fn encode_bash_command(command: &str) -> String {
+    let mut encoded = String::with_capacity(command.len());
+    for byte in command.bytes() {
+        if (0x20..=0x7e).contains(&byte) && !matches!(byte, b'\\' | b'|') {
+            encoded.push(byte as char);
+        } else {
+            write!(&mut encoded, "\\{byte:03o}").unwrap();
+        }
+    }
+    encoded
+}
+
 fn append_output(output: &mut Vec<u8>, bytes: &[u8], limit: usize, truncated: &mut bool) {
     let count = bytes.len().min(limit.saturating_sub(output.len()));
     output.extend_from_slice(&bytes[..count]);
@@ -427,6 +428,15 @@ fn append_output(output: &mut Vec<u8>, bytes: &[u8], limit: usize, truncated: &m
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn bash_encoding_escapes_protocol_separators_and_preserves_plain_ascii() {
+        assert_eq!(encode_bash_command("echo hello"), "echo hello");
+        assert_eq!(encode_bash_command("echo hello |"), "echo hello \\174");
+        assert_eq!(encode_bash_command("|a||b|"), "\\174a\\174\\174b\\174");
+        assert_eq!(encode_bash_command("a\\b\n\r"), "a\\134b\\012\\015");
+        assert_eq!(encode_bash_command("值"), "\\345\\200\\274");
+    }
 
     fn backends() -> Vec<(ShellKind, String)> {
         let native = ShellKind::native();
@@ -451,6 +461,24 @@ mod tests {
             .await
             .expect("shell protocol stalled")
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn marks_broker_sessions_to_prevent_accidental_self_update() {
+        for (kind, path) in backends() {
+            let shell = Shell::spawn_kind(kind, &path, 1024).await.unwrap();
+            let result = run(
+                &shell,
+                source(
+                    kind,
+                    "$env:SUDOSERVER_SESSION",
+                    "printf '%s\\n' \"$SUDOSERVER_SESSION\"",
+                ),
+            )
+            .await;
+            assert_eq!(result.output.trim(), "1");
+            shell.terminate().await;
+        }
     }
 
     #[tokio::test]
@@ -696,9 +724,9 @@ mod tests {
         assert_eq!(exited.exit_code, 5);
         assert!(exited.output.contains("important-diagnostic"));
 
-        let shell = Shell::spawn_kind(ShellKind::Bash, "/bin/bash", 1024)
-            .await
-            .unwrap();
+        let shell = bash_backend()
+            .expect("the configured Bash backend is available")
+            .await;
         let sete = shell
             .execute("set -e; echo before; false; echo after", None)
             .await
@@ -709,6 +737,7 @@ mod tests {
         assert!(!sete.output.contains("after"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn bash_background_job_does_not_stall_exit_and_is_killed() {
         let shell = match bash_backend() {
@@ -756,6 +785,29 @@ mod tests {
         // A user function named `read` must not break the protocol reader.
         run(&shell, "read() { echo NO; }; echo defined").await;
         assert!(run(&shell, "echo next").await.output.contains("next"));
+        shell.terminate().await;
+    }
+
+    #[tokio::test]
+    async fn bash_trailing_pipe_is_rejected_without_executing_partial_command() {
+        let shell = match bash_backend() {
+            Some(shell) => shell.await,
+            None => return,
+        };
+        let result = run(&shell, "printf SHOULD_NOT_RUN |").await;
+        assert_eq!(result.exit_code, 2);
+        assert!(!result.success);
+        assert!(!result.session_ended);
+        assert!(!result.output.starts_with("SHOULD_NOT_RUN"));
+        // An invalid pipeline must not execute its left side or poison the next call.
+        let result = run(&shell, "ss_pipe_test=changed |").await;
+        assert!(!result.success);
+        assert_eq!(
+            run(&shell, "printf '%s' \"${ss_pipe_test-unset}\"")
+                .await
+                .output,
+            "unset"
+        );
         shell.terminate().await;
     }
 

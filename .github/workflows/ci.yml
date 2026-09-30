@@ -21,6 +21,13 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: Embed the matching release candidate version
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        run: |
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
+          echo "SUDOSERVER_RELEASE_TAG=v${version}-rc.${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -46,10 +53,20 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all-targets
       - run: cargo build --release
+      - name: Verify embedded version
+        if: env.SUDOSERVER_RELEASE_TAG != ''
+        shell: bash
+        run: |
+          binary=target/release/sudoserver
+          if [[ "$RUNNER_OS" == Windows ]]; then binary="$binary.exe"; fi
+          actual="$("$binary" --version | tr -d '\r')"
+          test "$actual" = "sudoserver ${SUDOSERVER_RELEASE_TAG#v}"
+          printf '%s\n' "$actual" > target/release/release-version.txt
       - uses: actions/upload-artifact@v4
         with:
           name: sudoserver-${{ matrix.platform }}
           path: |
             target/release/sudoserver
             target/release/sudoserver.exe
+            target/release/release-version.txt
           if-no-files-found: error

@@ -14,12 +14,18 @@ base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 directories = "6"
+flate2 = "1"
+fs2 = "0.4"
 rand_core = { version = "0.6", features = ["getrandom"] }
 rpassword = "7"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
+tar = "0.4"
+tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 toml = "0.9"
 totp-rs = { version = "5.7", features = ["otpauth"] }
@@ -27,6 +33,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 zeroize = { version = "1", features = ["derive"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["process"] }
@@ -34,10 +41,15 @@ rustix = { version = "1", features = ["process"] }
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+plist = "1"
+
 [dev-dependencies]
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
-tempfile = "3"
+
+[build-dependencies]
+semver = "1"
 
 [profile.release]
 lto = "thin"

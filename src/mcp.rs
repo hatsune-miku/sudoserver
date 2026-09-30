@@ -44,7 +44,7 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
         "initialize" => Ok(json!({
             "protocolVersion": "2025-06-18",
             "capabilities": { "tools": { "listChanged": false } },
-            "serverInfo": { "name": "SudoServer", "version": env!("CARGO_PKG_VERSION") },
+            "serverInfo": { "name": "SudoServer", "version": crate::VERSION },
             "instructions": server_instructions()
         })),
         "ping" => Ok(json!({})),

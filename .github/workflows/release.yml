@@ -16,7 +16,7 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            artifact: sudoserver-windows-x86_64.exe
+            artifact: sudoserver-windows-x86_64
             binary: target/release/sudoserver.exe
           - os: ubuntu-latest
             artifact: sudoserver-linux-x86_64
@@ -30,6 +30,14 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: Validate and embed the release tag
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
+          test "$GITHUB_REF_NAME" = "v$version"
+          echo "SUDOSERVER_RELEASE_TAG=$GITHUB_REF_NAME" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
       - name: Cache Rust dependencies and build artifacts
         uses: actions/cache@v4
@@ -43,24 +51,37 @@ jobs:
             ${{ runner.os }}-${{ runner.arch }}-cargo-
       - run: cargo test --all-targets
       - run: cargo build --release
-      - name: Stage binary
+      - name: Verify embedded version
+        if: startsWith(github.ref, 'refs/tags/')
         shell: bash
-        run: cp '${{ matrix.binary }}' '${{ matrix.artifact }}'
+        env:
+          BINARY: ${{ matrix.binary }}
+        run: |
+          actual="$("$BINARY" --version | tr -d '\r')"
+          test "$actual" = "sudoserver ${SUDOSERVER_RELEASE_TAG#v}"
+          printf '%s\n' "$actual" > target/release/release-version.txt
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.binary }}
+            target/release/release-version.txt
 
   publish:
     if: startsWith(github.ref, 'refs/tags/')
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          path: artifacts
-          merge-multiple: true
+          path: binaries
+          merge-multiple: false
+      - name: Package verified binaries
+        env:
+          SUDOSERVER_RELEASE_TAG: ${{ github.ref_name }}
+        run: bash scripts/package-release.sh
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" artifacts/* --repo "$GITHUB_REPOSITORY" --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" assets/* --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes

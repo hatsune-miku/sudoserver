@@ -95,6 +95,30 @@ sudo launchctl print system/dev.sudoserver
 - MCP：`http://127.0.0.1:32119/mcp`
 - 健康检查：`http://127.0.0.1:32119/health`
 
+## 命令行自更新
+
+```powershell
+sudoserver update --check                 # 只查询 GitHub，不需要提权
+sudoserver update                         # 最新稳定版
+sudoserver update --prerelease            # 包含 RC，仍按语义版本选择最新版
+sudoserver update --tag v0.1.0-rc.8.1      # 指定标签（示例）
+# 确认需要降级时，同时指定 --tag 和 --allow-downgrade
+```
+
+实际更新需要 Administrator/root，来源固定为 `hatsune-miku/sudoserver` 的 GitHub Releases，不需要 GitHub 登录。`--check` 不下载二进制、不修改文件、不停止服务。稳定通道同时排除 prerelease 标记和带预发布后缀的标签，不会把历史上误标为正式版的 RC 当成稳定版；没有稳定版时使用 `--prerelease`。
+
+更新前先完成下载、SHA-256 校验、平台匹配和二进制版本检查，再备份旧程序并更新。已安装的系统服务只在原本运行时停止和恢复；不会改写服务注册、配置、Master Password 或 `seal.key`。重启会中断会话并使全部运行期 token 失效。新版本服务状态与 `/health` 版本检查失败时，自动恢复旧二进制并尝试恢复原服务；回滚本身失败会保留备份并明确报错。
+
+- Linux/macOS：在安装目录所在文件系统暂存完整文件，然后用 `rename` 原子替换路径，并同步目录。已运行进程继续使用旧文件，重启后使用新文件；这不是进程热升级，也不保证突然断电时整套服务操作具有事务性。
+- Windows：把替换交给隐藏的本地助手，等待原 CLI 退出后操作。命令输出助手日志路径；只有日志中的 `SUCCESS` 才表示完成，启动助手本身不代表更新成功。更新失败详情也写在该日志中。
+- 每次更新的 `.sudoserver-update-*` 恢复目录保留 `previous` 旧二进制；Windows 还保留助手和日志。确认新版本稳定后，可在没有更新进行时手动清理对应目录。不会自动覆盖已有备份。
+- 二进制及上级目录必须由 root/Administrators/SYSTEM 等受信主体控制，不能位于普通用户可写的源码目录、下载目录或 Homebrew 用户目录。Windows 建议放在权限受保护的 `C:\Program Files\SudoServer`；Unix 可使用 root 拥有且不可被普通用户写入的 `/opt/sudoserver`。更新器不会自动放宽 ACL、修改所有者或移动已安装服务。
+- 请从**独立管理员终端**运行，不要通过即将被停止的 SudoServer 会话自我更新。新会话带有 `SUDOSERVER_SESSION` 环境标记，更新器会据此拒绝实际更新（仍允许 `--check`）；这是防误操作提示，不是权限边界。手工 `serve` 前台实例不由更新器管理，需要自行停止/重启。自定义 systemd drop-in、非标准服务命令或处于过渡状态的服务会被拒绝，需手动更新。
+
+正式版和 RC 统一提供 Windows ZIP、Linux/macOS tar.gz 与 `SHA256SUMS`。CI 把完整 Release tag 和 commit 写入二进制，`--version`、MCP 初始化和 `/health` 使用同一版本；本地构建默认显示 `<Cargo版本>-dev`。早期 RC 没有嵌入完整标签，版本检查会拒绝安装它们；首次使用自更新需要先手动安装包含本功能的新 Release。
+
+安全边界：HTTPS、固定仓库与 SHA-256 用于传输/产物完整性验证，目前**没有独立发布签名**；校验值同样来自 GitHub，不能防御仓库或发布账户被攻陷。网络失败、API 限流、缺失校验值、校验不符、版本不符都会在停服前失败。
+
 ## 接入 AI Agent
 
 将 Agent 的 MCP 客户端连接到：
@@ -135,7 +159,7 @@ MCP 工具说明会明确当前平台和 shell。Agent 应按 `sudo_enter` 返�
 
 ## 配置
 
-默认配置由平台配置目录决定。也可为所有命令显式传 `--config`。主要字段：
+默认配置由平台配置目录决定。`init`、`serve`、`install` 可显式传 `--config`；`update` 从已安装服务的注册信息读取配置路径。主要字段：
 
 ```toml
 bind = "127.0.0.1:32119"
@@ -168,7 +192,7 @@ cargo test --all-targets
 
 集成测试调用本平台 shell，验证管道、通配符、多行、Unicode、错误流、退出码、状态继承、截断后同步、可选超时、无限时命令取消，以及 HTTP 签发/复用/执行/撤销生命周期。所需 shell 缺失会让测试失败。CI 覆盖 Windows x86_64、Linux x86_64、macOS Apple Silicon 和 Intel，macOS 使用系统 Bash 3.2。
 
-`main` 分支 push 触发 `CI` 后，只有全部平台测试、构建并上传成品成功，`Release Candidate` 才会接续运行。它按平台分别下载该次 CI 成品（不重复构建），打包为 Windows ZIP、Linux/macOS tar.gz，生成 `SHA256SUMS`，并以 `v<项目版本>-rc.<CI序号>.<重试序号>` 创建 GitHub prerelease。PR 检查不会发布 RC；正式版 `Release` 工作流也明确排除 `-rc.*` tag。
+`main` 分支 push 触发 `CI` 后，只有全部平台测试、构建并上传成品成功，`Release Candidate` 才会接续运行。它按平台分别下载该次 CI 成品（不重复构建），打包为 Windows ZIP、Linux/macOS tar.gz，生成 `SHA256SUMS`，并以 `v<项目版本>-rc.<CI序号>.<重试序号>` 创建 GitHub prerelease。PR 检查不会发布 RC；正式版 `Release` 工作流也明确排除 `-rc.*` tag。重试发布用的 CI 时需重跑全部平台；打包阶段会拒绝不同重试序号的版本混装。
 
 ## License
 

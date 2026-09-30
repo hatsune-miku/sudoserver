@@ -36,28 +36,6 @@ jobs:
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ github.token }}
 
-      - name: Verify and package all platforms
-        shell: bash
-        run: |
-          mkdir -p assets
-          for platform in windows-x86_64 linux-x86_64 macos-aarch64 macos-x86_64; do
-            binary=sudoserver
-            if [[ "$platform" == windows-* ]]; then binary=sudoserver.exe; fi
-            source="binaries/sudoserver-$platform/$binary"
-            test -f "$source" || { echo "$platform artifact is missing" >&2; exit 1; }
-            package="SudoServer-$platform"
-            mkdir -p "packages/$package"
-            cp "$source" "packages/$package/"
-            cp README.md LICENSE-MIT "packages/$package/"
-            if [[ "$platform" == windows-* ]]; then
-              (cd packages && zip -qr "../assets/sudoserver-$platform.zip" "$package")
-            else
-              chmod +x "packages/$package/sudoserver"
-              tar -czf "assets/sudoserver-$platform.tar.gz" -C packages "$package"
-            fi
-          done
-          (cd assets && sha256sum sudoserver-* > SHA256SUMS)
-
       - name: Derive release candidate version
         id: version
         env:
@@ -72,6 +50,12 @@ jobs:
           fi
           tag="v${version}-rc.${RUN_NUMBER}.${RUN_ATTEMPT}"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Verify and package all platforms
+        shell: bash
+        env:
+          SUDOSERVER_RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: bash scripts/package-release.sh
 
       - name: Create GitHub prerelease
         env:

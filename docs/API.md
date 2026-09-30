@@ -4,6 +4,8 @@
 
 ## 普通授权接口
 
+`GET /health` 无需凭据，返回 `status`、`service`、`version` 和 `commit`。版本为构建时嵌入的 Release 版本（不带 `v` 前缀），本地构建为 `<Cargo版本>-dev`。命令行更新器使用此接口确认服务运行的是预期版本。HTTP/MCP 不提供更新或下载执行接口。
+
 进入会话：
 
 ```http

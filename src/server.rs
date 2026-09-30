@@ -351,7 +351,9 @@ async fn index() -> Html<&'static str> {
 }
 
 async fn health() -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "status": "ok", "service": "SudoServer" }))
+    Json(
+        serde_json::json!({ "status": "ok", "service": "SudoServer", "version": crate::VERSION, "commit": crate::COMMIT }),
+    )
 }
 
 async fn enter(
@@ -471,6 +473,19 @@ mod tests {
         };
         let auth = AuthManager::new(config.password_hash.clone(), None);
         router(AppState::new(config, auth))
+    }
+
+    #[tokio::test]
+    async fn health_exposes_the_embedded_release_identity() {
+        let response = test_app()
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["version"], crate::VERSION);
+        assert_eq!(body["commit"], crate::COMMIT);
     }
 
     #[tokio::test]

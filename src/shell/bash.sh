@@ -1,4 +1,5 @@
-# Bash 3.2-compatible protocol. fd 3 is input; fd 4 is the reliable output/frame
+# Keep LF line endings: this Bash 3.2-compatible bootstrap is embedded verbatim.
+# fd 3 is input; fd 4 is the reliable output/frame
 # channel, a private dup of the original stdout that commands cannot reach.
 exec 3<&0 4>&1
 # `builtin` bypasses any read/printf/eval a command may later define as a function.

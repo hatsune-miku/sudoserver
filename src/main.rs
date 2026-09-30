@@ -20,11 +20,12 @@ use zeroize::{Zeroize, Zeroizing};
 
 #[cfg(any(target_os = "macos", test))]
 mod launchd;
+mod update;
 #[cfg(windows)]
 mod windows_service_host;
 
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version = sudoserver::VERSION, about)]
 struct Cli {
     #[command(subcommand)]
     command: CommandKind,
@@ -59,6 +60,12 @@ enum CommandKind {
     },
     /// Stop and unregister the native system service without deleting configuration.
     Uninstall,
+    /// Check for or install an update from the official GitHub Releases.
+    Update(update::Options),
+    /// Internal updater; only a prepared, local update plan is accepted.
+    #[cfg(windows)]
+    #[command(hide = true)]
+    ApplyUpdate { plan: PathBuf },
     /// Internal entry point used by the Windows Service Control Manager.
     #[cfg(windows)]
     #[command(hide = true)]
@@ -89,6 +96,13 @@ async fn main() -> Result<()> {
         } => serve(config_path(config)?, allow_unelevated).await,
         CommandKind::Install { config } => install(config_path(config)?),
         CommandKind::Uninstall => uninstall(),
+        CommandKind::Update(options) => {
+            tokio::task::spawn_blocking(move || update::run(options)).await?
+        }
+        #[cfg(windows)]
+        CommandKind::ApplyUpdate { plan } => {
+            tokio::task::spawn_blocking(move || update::apply_helper(&plan)).await?
+        }
         #[cfg(windows)]
         CommandKind::Service { config } => windows_service_host::dispatch(config_path(config)?),
     }
@@ -419,5 +433,25 @@ mod tests {
     fn parses_uninstall_subcommand() {
         let cli = Cli::try_parse_from(["sudoserver", "uninstall"]).unwrap();
         assert!(matches!(cli.command, CommandKind::Uninstall));
+    }
+
+    #[test]
+    fn parses_update_options_and_rejects_ambiguous_downgrades() {
+        assert!(Cli::try_parse_from(["sudoserver", "update", "--check", "--prerelease"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "sudoserver",
+                "update",
+                "--tag",
+                "v0.1.0",
+                "--allow-downgrade"
+            ])
+            .is_ok()
+        );
+        assert!(Cli::try_parse_from(["sudoserver", "update", "--allow-downgrade"]).is_err());
+        assert!(
+            Cli::try_parse_from(["sudoserver", "update", "--tag", "v0.1.0", "--prerelease"])
+                .is_err()
+        );
     }
 }

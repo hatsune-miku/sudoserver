@@ -1,0 +1,2 @@
+# Bash bootstrap is embedded verbatim and must also work in Windows checkouts.
+*.sh text eol=lf
