@@ -44,6 +44,11 @@ pub struct ExecutionResult {
     pub exit_code: i32,
     pub success: bool,
     pub truncated: bool,
+    /// The shell exited while running or right after this command (for example
+    /// `exit`, `exec`, or a failure under `set -e`). The captured output and the
+    /// shell's own exit code are still returned, but the session is now gone and
+    /// further commands on this handle will fail.
+    pub session_ended: bool,
 }
 
 #[derive(Debug, Error)]
@@ -58,6 +63,8 @@ pub enum ShellError {
     InvalidResponse,
     #[error("command exceeded the {0}-second timeout; the session was destroyed")]
     Timeout(u64),
+    #[error("command rejected: {0}")]
+    Rejected(&'static str),
 }
 
 struct Request {
@@ -99,12 +106,17 @@ impl Shell {
                     _ = cancelled.changed() => Err(ShellError::Ended),
                     result = process.execute(&request.command, request.timeout_seconds) => result,
                 };
-                let failed = result.is_err();
-                if failed {
+                // Any error, or a shell that exited during the command, ends the
+                // session; its children are reaped before the next caller runs.
+                let ended = match &result {
+                    Err(_) => true,
+                    Ok(execution) => execution.session_ended,
+                };
+                if ended {
                     process.terminate().await;
                 }
                 let _ = request.reply.send(result);
-                if failed {
+                if ended {
                     break;
                 }
             }
@@ -122,6 +134,11 @@ impl Shell {
         command: &str,
         timeout_seconds: Option<u64>,
     ) -> Result<ExecutionResult, ShellError> {
+        if command.as_bytes().contains(&0) {
+            // A NUL cannot survive transport through the shell's own string
+            // handling, so it would silently truncate the command; reject it.
+            return Err(ShellError::Rejected("command must not contain NUL bytes"));
+        }
         if self.is_finished() {
             return Err(ShellError::Ended);
         }
@@ -161,6 +178,12 @@ struct Process {
     stdout: ChildStdout,
     pending: Vec<u8>,
     max_output_bytes: usize,
+    /// The shell's process-group id, captured at spawn so the group can still be
+    /// signalled after the leader has been reaped for its exit code. While a
+    /// child of the group is alive the kernel keeps this id reserved, so it never
+    /// aliases an unrelated process.
+    #[cfg(unix)]
+    pgid: Option<i32>,
 }
 impl Process {
     fn spawn(
@@ -189,6 +212,11 @@ impl Process {
                 for name in ["BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS", "CDPATH"] {
                     command.env_remove(name);
                 }
+                // Put the shell in its own process group so a timeout, destroy or
+                // revoke can signal the whole group, reaping children the command
+                // launched, not just the shell itself.
+                #[cfg(unix)]
+                command.process_group(0);
             }
         }
         let mut child = command
@@ -202,6 +230,9 @@ impl Process {
         let stdout = child.stdout.take().ok_or(ShellError::Ended)?;
         Ok(Self {
             kind,
+            // process_group(0) makes the pgid equal the shell's own pid.
+            #[cfg(unix)]
+            pgid: child.id().map(|pid| pid as i32),
             child,
             stdin,
             stdout,
@@ -232,9 +263,19 @@ impl Process {
         let encoded = match self.kind {
             ShellKind::PowerShell => STANDARD.encode(command.as_bytes()),
             ShellKind::Bash => {
-                let mut encoded = String::with_capacity(command.len() * 4);
+                // Reconstructed by `printf %b`. Printable ASCII (except backslash,
+                // which `%b` would treat as an escape) passes through verbatim;
+                // everything else, including newlines, `|`, and non-ASCII bytes,
+                // is octal-escaped so the transport line stays single-line and
+                // unambiguous. This keeps ASCII-heavy commands roughly a quarter
+                // of the previous size without adding an external decoder.
+                let mut encoded = String::with_capacity(command.len());
                 for byte in command.bytes() {
-                    write!(&mut encoded, "\\{byte:03o}").unwrap();
+                    if (0x20..=0x7e).contains(&byte) && byte != b'\\' {
+                        encoded.push(byte as char);
+                    } else {
+                        write!(&mut encoded, "\\{byte:03o}").unwrap();
+                    }
                 }
                 encoded
             }
@@ -268,12 +309,17 @@ impl Process {
                             exit_code,
                             success: exit_code == 0,
                             truncated,
+                            session_ended: false,
                         });
                     }
                     if self.pending.len() > 12 {
                         return Err(ShellError::InvalidResponse);
                     }
-                    self.read_more().await?;
+                    if let Fill::ShellExited = self.fill().await? {
+                        // The frame began but its exit-code terminator never
+                        // arrived; the shell died mid-frame. Return what we have.
+                        return Ok(self.ended_result(output, truncated).await);
+                    }
                 }
             }
             // Retain only a possible partial delimiter. Drain excess output even
@@ -286,22 +332,90 @@ impl Process {
                 &mut truncated,
             );
             self.pending.drain(..count);
-            self.read_more().await?;
+            if let Fill::ShellExited = self.fill().await? {
+                // The shell exited without completing this command (exit, exec,
+                // a failure under set -e, ...). Whatever it had buffered is real
+                // output; flush it and report the shell's own exit code.
+                append_output(
+                    &mut output,
+                    &self.pending,
+                    self.max_output_bytes,
+                    &mut truncated,
+                );
+                self.pending.clear();
+                return Ok(self.ended_result(output, truncated).await);
+            }
         }
     }
-    async fn read_more(&mut self) -> Result<(), ShellError> {
+    /// Read more shell output, or observe that the shell process has exited.
+    /// Selecting on the child means a lingering background job holding the pipe
+    /// open cannot stall a command whose shell has already gone.
+    async fn fill(&mut self) -> Result<Fill, ShellError> {
         let mut bytes = [0_u8; 8192];
-        let count = self.stdout.read(&mut bytes).await.map_err(ShellError::Io)?;
+        let Self {
+            child,
+            stdout,
+            pending,
+            ..
+        } = self;
+        let count = tokio::select! {
+            biased;
+            read = stdout.read(&mut bytes) => read.map_err(ShellError::Io)?,
+            _ = child.wait() => return Ok(Fill::ShellExited),
+        };
         if count == 0 {
-            return Err(ShellError::Ended);
+            return Ok(Fill::ShellExited);
         }
-        self.pending.extend_from_slice(&bytes[..count]);
-        Ok(())
+        pending.extend_from_slice(&bytes[..count]);
+        Ok(Fill::Data)
+    }
+    async fn ended_result(&mut self, output: Vec<u8>, truncated: bool) -> ExecutionResult {
+        let exit_code = self.shell_exit_code().await;
+        ExecutionResult {
+            output: String::from_utf8_lossy(&output).into_owned(),
+            exit_code,
+            success: exit_code == 0,
+            truncated,
+            session_ended: true,
+        }
+    }
+    async fn shell_exit_code(&mut self) -> i32 {
+        match self.child.wait().await {
+            Ok(status) => status.code().unwrap_or_else(|| {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+                    status.signal().map_or(-1, |signal| 128 + signal)
+                }
+                #[cfg(not(unix))]
+                {
+                    -1
+                }
+            }),
+            Err(_) => -1,
+        }
     }
     async fn terminate(&mut self) {
+        // Kill the whole process group first so children the command spawned die
+        // with the shell; then reap the shell itself.
+        #[cfg(unix)]
+        self.kill_process_group();
         let _ = self.child.kill().await;
         let _ = self.child.wait().await;
     }
+    #[cfg(unix)]
+    fn kill_process_group(&self) {
+        use rustix::process::{Pid, Signal, kill_process_group};
+        // Use the pgid captured at spawn, not child.id(): by teardown the leader
+        // may already be reaped, but stragglers it launched can still be running.
+        if let Some(pid) = self.pgid.and_then(Pid::from_raw) {
+            let _ = kill_process_group(pid, Signal::KILL); // best effort
+        }
+    }
+}
+enum Fill {
+    Data,
+    ShellExited,
 }
 fn append_output(output: &mut Vec<u8>, bytes: &[u8], limit: usize, truncated: &mut bool) {
     let count = bytes.len().min(limit.saturating_sub(output.len()));
@@ -532,14 +646,163 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shell_exit_is_reported_without_hanging() {
+    async fn shell_exit_reports_exit_code_then_ends_session() {
         for (kind, path) in backends() {
             let shell = Shell::spawn_kind(kind, &path, 1024).await.unwrap();
             let result =
                 tokio::time::timeout(Duration::from_secs(10), shell.execute("exit 3", None))
                     .await
-                    .unwrap();
-            assert!(result.is_err());
+                    .expect("a shell exit must not hang")
+                    .expect("a shell exit is reported as a result, not an I/O error");
+            assert!(result.session_ended);
+            assert_eq!(result.exit_code, 3);
+            // The session is gone; the next command fails fast rather than hanging.
+            assert!(
+                tokio::time::timeout(Duration::from_secs(10), shell.execute("echo next", None))
+                    .await
+                    .expect("the next command must not hang")
+                    .is_err()
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn rejects_commands_containing_nul() {
+        for (kind, path) in backends() {
+            let shell = Shell::spawn_kind(kind, &path, 1024).await.unwrap();
+            assert!(matches!(
+                shell.execute("echo a\0b", None).await,
+                Err(ShellError::Rejected(_))
+            ));
+            // A rejected command must leave the session usable.
+            assert!(run(&shell, "echo alive").await.output.contains("alive"));
+            shell.terminate().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn bash_shell_exit_preserves_output_and_exit_code() {
+        // set -e and a bare exit are common in agent scripts; the diagnostic
+        // output and exit code must survive, not be replaced by a bare error.
+        let shell = match bash_backend() {
+            Some(shell) => shell.await,
+            None => return,
+        };
+        let exited = shell
+            .execute("echo important-diagnostic; exit 5", None)
+            .await
+            .expect("a clean exit is a result");
+        assert!(exited.session_ended);
+        assert_eq!(exited.exit_code, 5);
+        assert!(exited.output.contains("important-diagnostic"));
+
+        let shell = Shell::spawn_kind(ShellKind::Bash, "/bin/bash", 1024)
+            .await
+            .unwrap();
+        let sete = shell
+            .execute("set -e; echo before; false; echo after", None)
+            .await
+            .expect("a set -e failure is a result");
+        assert!(sete.session_ended);
+        assert_eq!(sete.exit_code, 1);
+        assert!(sete.output.contains("before"));
+        assert!(!sete.output.contains("after"));
+    }
+
+    #[tokio::test]
+    async fn bash_background_job_does_not_stall_exit_and_is_killed() {
+        let shell = match bash_backend() {
+            Some(shell) => shell.await,
+            None => return,
+        };
+        let started = Instant::now();
+        // The background sleep holds the output pipe open after the shell exits.
+        let result = tokio::time::timeout(
+            Duration::from_secs(8),
+            shell.execute("sleep 300 & echo $!; exit 0", None),
+        )
+        .await
+        .expect("must not wait for the detached background job to finish")
+        .expect("exit is reported");
+        assert!(result.session_ended);
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        // The session-ended path also signals the process group, so the orphaned
+        // child does not keep running with the shell's privileges.
+        #[cfg(unix)]
+        {
+            let pid: i32 = result.output.trim().parse().expect("a background PID");
+            let mut waited = 0;
+            while process_is_alive(pid) && waited < 50 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                waited += 1;
+            }
+            assert!(
+                !process_is_alive(pid),
+                "background child {pid} survived exit"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bash_command_redirection_and_read_redefinition_stay_isolated() {
+        let shell = match bash_backend() {
+            Some(shell) => shell.await,
+            None => return,
+        };
+        // `exec >/dev/null` must only affect its own command, not the session.
+        assert_eq!(run(&shell, "exec >/dev/null; echo hidden").await.output, "");
+        assert!(run(&shell, "echo visible").await.output.contains("visible"));
+        // A user function named `read` must not break the protocol reader.
+        run(&shell, "read() { echo NO; }; echo defined").await;
+        assert!(run(&shell, "echo next").await.output.contains("next"));
+        shell.terminate().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_session_teardown_kills_child_processes() {
+        let shell = match bash_backend() {
+            Some(shell) => shell.await,
+            None => return,
+        };
+        let pid: i32 = run(&shell, "sleep 300 & echo $!")
+            .await
+            .output
+            .trim()
+            .parse()
+            .expect("a background PID");
+        assert!(process_is_alive(pid));
+        shell.terminate().await;
+        // The shell's process group was signalled, so the child dies too.
+        let mut deadline = 0;
+        while process_is_alive(pid) && deadline < 50 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            deadline += 1;
+        }
+        assert!(
+            !process_is_alive(pid),
+            "child {pid} survived session teardown"
+        );
+    }
+
+    /// The native bash backend, or `None` on a platform whose native shell is
+    /// not bash and where no test bash was provided.
+    fn bash_backend() -> Option<impl std::future::Future<Output = Shell>> {
+        backends()
+            .into_iter()
+            .find(|(kind, _)| *kind == ShellKind::Bash)
+            .map(|(kind, path)| async move { Shell::spawn_kind(kind, &path, 1024).await.unwrap() })
+    }
+
+    #[cfg(unix)]
+    fn process_is_alive(pid: i32) -> bool {
+        std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
     }
 }

@@ -152,8 +152,8 @@ max_output_bytes = 8388608
 - 信任边界与原始需求一致：正确提供 Master Password/TOTP 的主体视为用户本人；正确提供 token/handle 的主体拥有相应运行期权限。
 - 管理凭据不会写入日志或明文存储，但会在验证时短暂存在于服务内存。拥有本机 root/Administrator 的攻击者本来就位于本组件保护边界之外，也能读取进程或 seal key。
 - PowerShell 使用 `-NoProfile -NonInteractive`；Bash 使用 `--noprofile --norc`，同时移除 `BASH_ENV` 等启动注入变量。二者继承系统服务身份和环境，不加载桌面用户 profile。
-- 响应在命令完成后返回，不是流式接口；超过 `max_output_bytes` 会截断并继续排空输出，保证后续命令不串包。命令默认无限时，但销毁会话、撤销令牌和服务关闭可中断正在执行的命令。终止 shell 不保证终止其子进程或主动分离的后台进程。
-- 会话非交互式，不支持终端输入；Bash 命令的 stdin 为 `/dev/null`。`exit`、`exec` 或导致 shell 退出的选项（例如 Bash `set -e` 后失败）可能结束会话。令牌过期会阻止后续调用，不额外为已启动的命令添加计时器。
+- 响应在命令完成后返回，不是流式接口；超过 `max_output_bytes` 会截断并继续排空输出，保证后续命令不串包。命令默认无限时，但销毁会话、撤销令牌和服务关闭可中断正在执行的命令。Linux/macOS 会将 shell 放入独立进程组，终止时向整个进程组发信号，一并回收命令启动的子进程和后台任务；主动 `setsid` 或新建进程组脱离的进程仍可能存活。
+- 会话非交互式，不支持终端输入；Bash 命令的 stdin 为 `/dev/null`。`exit`、`exec` 或导致 shell 退出的选项（例如 Bash `set -e` 后失败）会结束会话，但本次调用仍返回已产生的输出与退出码，并置 `session_ended=true`。命令中的 NUL 字节会被拒绝而非静默截断。令牌过期会阻止后续调用，不额外为已启动的命令添加计时器。
 - 本项目不声称抵抗已经取得本机高权限的恶意软件，也不替代操作系统审计、备份和最小权限策略。
 
 更详细的可行性与设计取舍见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。

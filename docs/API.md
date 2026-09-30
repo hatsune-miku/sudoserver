@@ -27,16 +27,18 @@ Content-Type: application/json
 返回：
 
 ```json
-{"output":"...","exit_code":0,"success":true,"truncated":false}
+{"output":"...","exit_code":0,"success":true,"truncated":false,"session_ended":false}
 ```
 
-示例命令使用 Windows PowerShell 语法。Linux/macOS 应使用 Bash，例如 `ps -eo pid,comm | head -n 6`。
+示例命令使用 Windows PowerShell 语法。Linux/macOS 应使用 Bash，例如 `ps -eo pid,comm | head -n 6`。命令中不得包含 NUL 字节，否则返回 400 且会话保持可用。
 
 `timeout_seconds` 省略或为 `null` 时，命令没有执行时间上限；显式传入时必须是正整数，不受原先 300 秒的限制。超时会销毁会话。令牌有效期是独立的授权规则：过期后禁止后续调用，不为执行中的命令增加截止时间。
 
 PowerShell 的 success/error/warning/verbose/debug/information 流通过 `*>&1` 合并为文本。`exit_code` 优先采用原生进程的 `$LASTEXITCODE`；非终止 PowerShell 错误返回 1。Bash 合并 stdout/stderr，返回最后一条命令的退出码（管道遵从当前 `pipefail` 设置）。返回的文本最多保留 `max_output_bytes` 字节，非 UTF-8 字节以替换字符解码。
 
-同一会话的命令串行执行，变量、函数、环境和目录持续保留；调用方断开连接不会遗弃未读响应或自动取消执行。销毁会话、撤销令牌及服务关闭均可取消正在执行及排队中的命令。命令不支持交互 stdin；Bash stdin 为 `/dev/null`。`exit`、`exec` 等导致 shell 退出的操作会使会话失效。
+同一会话的命令串行执行，变量、函数、环境和目录持续保留；调用方断开连接不会遗弃未读响应或自动取消执行。销毁会话、撤销令牌及服务关闭均可取消正在执行及排队中的命令，并向 shell 所在进程组发送信号，一并终止命令启动的子进程和后台任务（主动 `setsid`/新建进程组脱离者除外）。命令不支持交互 stdin；Bash stdin 为 `/dev/null`。
+
+`exit`、`exec` 或 `set -e` 下的失败等使 shell 退出的操作会结束会话。此时本次调用仍返回已产生的输出和 shell 的实际退出码，并将 `session_ended` 置为 `true`；该 handle 之后的调用将失败。正常命令的 `session_ended` 为 `false`。
 
 销毁会话：`POST /v1/sessions/destroy`，body 为 `{ "handle": "<HANDLE>" }`。
 

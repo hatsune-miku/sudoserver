@@ -24,13 +24,15 @@ Axum transport ── admin authentication ── Argon2id / RFC 6238
 
 ### 命令执行
 
-不自行解析或重写用户命令。Windows 启动 `pwsh -NoProfile -NonInteractive -EncodedCommand` bootstrap，命令通过 UTF-8→Base64 编码传输，由 `[ScriptBlock]::Create` 原生解析并在当前作用域执行。Unix 启动 `/bin/bash --noprofile --norc -c` bootstrap，移除 `BASH_ENV` 等启动变量；命令通过八进制字节编码传输，由 Bash 内建 `printf -v` 无外部依赖地还原，再在父 shell 中 `eval`，不使用丢失状态的命令替换或子 shell。
+不自行解析或重写用户命令。Windows 启动 `pwsh -NoProfile -NonInteractive -EncodedCommand` bootstrap，命令通过 UTF-8→Base64 编码传输，由 `[ScriptBlock]::Create` 原生解析并在当前作用域执行。Unix 启动 `/bin/bash --noprofile --norc -c` bootstrap，移除 `BASH_ENV` 等启动变量；命令按字节编码传输（可打印 ASCII 直传、其余转义为八进制），由 Bash 内建 `printf -v` 无外部依赖地还原，再在父 shell 中 `eval`，不使用丢失状态的命令替换或子 shell。因变量无法承载 NUL，含 NUL 的命令在入口即被拒绝，不会静默截断。
+
+bootstrap 用 `builtin read`/`printf`/`eval` 读取协议，命令即便重定义同名函数也不影响读循环；命令的 stdout/stderr 经一个私有的原始 stdout 副本（fd 4）传出，完成帧也走 fd 4，因此命令内的 `exec >…` 只改写自身 fd 1、不会静音后续命令，也无法伪造或破坏帧。
 
 随机 144-bit marker 和控制字符将每个请求的完成帧定界；原始输出通过管道持续读取，仅保存配置容量内的部分，并在截断后继续排空。PowerShell 对象使用 `Out-String -Stream` 转成文本。handle 自身为独立的 256-bit 随机秘密。
 
 这比“每次调用启动一个 shell”多一些 framing 复杂度，但保留了变量、环境和当前目录，符合会话语义。比自行实现 shell grammar 可靠得多。命令本身拥有 root 权限，因此刻意伪造 framing 不构成额外权限提升。
 
-每个会话由独立 worker 持有进程和输入输出，队列串行执行命令；取消信号不依赖执行锁，因此无限时命令也可以被销毁、撤销或服务关闭中断。HTTP 调用方断开后，worker 仍消费完整响应，避免后续命令串包。服务关闭时拒绝新会话并取消全部已有会话，再等待 HTTP 请求退出。
+每个会话由独立 worker 持有进程和输入输出，队列串行执行命令；取消信号不依赖执行锁，因此无限时命令也可以被销毁、撤销或服务关闭中断。读循环同时监听 shell 进程退出，因此 shell 因 `exit`/`exec`/`set -e` 失败而退出、或后台任务仍占着输出管道时，本次调用不会挂起，而是返回已产生的输出与 shell 的实际退出码并标记 `session_ended`。Unix 下 shell 以 `process_group(0)` 独占进程组，中断时对整个进程组发 `SIGKILL`（通过安全的 `rustix`，不引入 `unsafe`），回收命令启动的子进程；进程组 id 在 spawn 时记录，即使先回收 leader 取退出码也能可靠发信号。HTTP 调用方断开后，worker 仍消费完整响应，避免后续命令串包。服务关闭时拒绝新会话并取消全部已有会话，再等待 HTTP 请求退出。
 
 默认不设命令或会话运行时长上限，删除 `max_command_seconds` 配置；调用方仍可显式指定正整数 `timeout_seconds`。令牌有效期保持独立，只对授权及后续调用做检查。旧 Unix 默认 `shell = "pwsh"` 在加载配置时迁移为 `/bin/bash`，旧自定义路径需手动修改。
 
@@ -66,5 +68,5 @@ Master Password 只保存 Argon2id PHC verifier。TOTP 验证在数学上必须�
 
 - 当前输出为有大小上限的聚合响应，不支持 stdin 交互或实时流；长时间任务可运行至完成，但 HTTP/MCP 客户端可能有自己的超时。
 - Windows、Linux、macOS 服务安装路径均指向当前二进制；升级时应先停止服务并替换已安装位置。macOS 使用 `/Library/LaunchDaemons/dev.sudoserver.plist`，`bootstrap system` 安装，`bootout` 卸载；配置和 seal key 保留。
-- 取消会话终止 shell 主进程，不保证回收其全部子进程或主动分离的后台进程；这不是进程容器或作业调度器。
+- 取消会话向 shell 进程组发 `SIGKILL`，回收命令启动的普通子进程和后台任务，但主动 `setsid`/新建进程组脱离者或已 daemon 化的进程仍可能存活；这不是进程容器或作业调度器。命令若刻意改写协议内部使用的 `__ss_`-前缀变量，只会破坏其自身会话（该会话以 root 运行，不构成额外提权）。
 - 审计日志有意不记录命令和 secret，避免产生第二份敏感数据。组织环境若需要审计，应设计带访问控制与脱敏策略的独立 sink。

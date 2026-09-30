@@ -88,6 +88,7 @@ impl From<ShellError> for ApiError {
     fn from(error: ShellError) -> Self {
         let status = match error {
             ShellError::Timeout(_) => StatusCode::REQUEST_TIMEOUT,
+            ShellError::Rejected(_) => StatusCode::BAD_REQUEST,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         Self {
@@ -194,7 +195,14 @@ impl AppState {
                 .ok_or_else(|| ApiError::from(AuthError::InvalidCredential))?
         };
         let result = shell.execute(command, requested_timeout).await;
-        if result.is_err() {
+        // A rejected command leaves the session healthy; any other error, or a
+        // command that ended the shell, invalidates the handle.
+        let ended = match &result {
+            Ok(execution) => execution.session_ended,
+            Err(ShellError::Rejected(_)) => false,
+            Err(_) => true,
+        };
+        if ended {
             let mut sessions = self.sessions.lock().await;
             remove_session(&mut sessions, handle);
         }

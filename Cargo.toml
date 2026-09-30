@@ -29,7 +29,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 zeroize = { version = "1", features = ["derive"] }
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+rustix = { version = "1", features = ["process"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8"

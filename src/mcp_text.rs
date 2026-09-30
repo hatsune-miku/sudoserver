@@ -52,7 +52,7 @@ pub fn tool_definitions() -> Value {
         {
             "name": "sudo_run",
             "title": format!("Run privileged {shell} script and get raw output"),
-            "description": format!("Run the command verbatim in the persistent privileged {shell} session. {shell} itself parses pipelines, wildcards, multiline scripts and environment variables. State, current directory and environment persist between calls. Output streams are merged. Execution has no default timeout; optionally supply timeout_seconds. Commands are noninteractive; exit or exec can end the session."),
+            "description": format!("Run the command verbatim in the persistent privileged {shell} session. {shell} itself parses pipelines, wildcards, multiline scripts and environment variables. State, current directory and environment persist between calls. Output streams are merged. Execution has no default timeout; optionally supply timeout_seconds. Commands are noninteractive; exit, exec or a set -e failure ends the session, in which case the produced output and exit code are still returned with session_ended set to true and the handle stops working. A command must not contain NUL bytes."),
             "inputSchema": {
                 "type": "object",
                 "properties": {
