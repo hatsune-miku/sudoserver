@@ -790,12 +790,41 @@ mod tests {
 
     #[tokio::test]
     async fn bash_trailing_pipe_is_rejected_without_executing_partial_command() {
-        let shell = match bash_backend() {
-            Some(shell) => shell.await,
-            None => return,
+        let Some((kind, path)) = backends()
+            .into_iter()
+            .find(|(kind, _)| *kind == ShellKind::Bash)
+        else {
+            return;
         };
-        let result = run(&shell, "printf SHOULD_NOT_RUN |").await;
-        assert_eq!(result.exit_code, 2);
+        let invalid = "printf SHOULD_NOT_RUN |";
+        // Bash 3.2 (macOS) reports 1 for this eval syntax error; newer Bash
+        // reports 2. The broker must preserve the configured shell's result,
+        // not impose one version's error code on every supported backend.
+        let native = Command::new(&path)
+            .args([
+                "--noprofile",
+                "--norc",
+                "-c",
+                "builtin eval -- \"$1\"",
+                "sudoserver-test",
+                invalid,
+            ])
+            .env_remove("BASH_ENV")
+            .env_remove("ENV")
+            .env_remove("SHELLOPTS")
+            .env_remove("BASHOPTS")
+            .env_remove("CDPATH")
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .expect("the configured Bash can evaluate the reference command");
+        let expected_exit = native.status.code().expect("Bash exited normally");
+        assert_ne!(expected_exit, 0);
+        assert!(native.stdout.is_empty());
+
+        let shell = Shell::spawn_kind(kind, &path, 1024).await.unwrap();
+        let result = run(&shell, invalid).await;
+        assert_eq!(result.exit_code, expected_exit);
         assert!(!result.success);
         assert!(!result.session_ended);
         assert!(!result.output.starts_with("SHOULD_NOT_RUN"));
