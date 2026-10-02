@@ -27,7 +27,7 @@ jobs:
         run: |
           version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
           [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
-          echo "SUDOSERVER_RELEASE_TAG=v${version}-rc.${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
+          echo "LOCALSHELLD_RELEASE_TAG=v${version}-rc.${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -53,20 +53,23 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all-targets
       - run: cargo build --release
+      - name: Verify real user and root daemon identities
+        if: runner.os != 'Windows'
+        run: python3 scripts/test-dual-daemon.py target/release/localshelld
       - name: Verify embedded version
-        if: env.SUDOSERVER_RELEASE_TAG != ''
+        if: env.LOCALSHELLD_RELEASE_TAG != ''
         shell: bash
         run: |
-          binary=target/release/sudoserver
+          binary=target/release/localshelld
           if [[ "$RUNNER_OS" == Windows ]]; then binary="$binary.exe"; fi
           actual="$("$binary" --version | tr -d '\r')"
-          test "$actual" = "sudoserver ${SUDOSERVER_RELEASE_TAG#v}"
+          test "$actual" = "localshelld ${LOCALSHELLD_RELEASE_TAG#v}"
           printf '%s\n' "$actual" > target/release/release-version.txt
       - uses: actions/upload-artifact@v4
         with:
-          name: sudoserver-${{ matrix.platform }}
+          name: localshelld-${{ matrix.platform }}
           path: |
-            target/release/sudoserver
-            target/release/sudoserver.exe
+            target/release/localshelld
+            target/release/localshelld.exe
             target/release/release-version.txt
           if-no-files-found: error

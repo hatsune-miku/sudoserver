@@ -11,7 +11,7 @@ use windows_service::{
     service_dispatcher,
 };
 
-const SERVICE_NAME: &str = "SudoServer";
+const SERVICE_NAME: &str = "localshelld";
 static CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 define_windows_service!(ffi_service_main, service_main);

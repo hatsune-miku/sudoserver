@@ -11,9 +11,12 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use sudoserver::{
+use localshelld::{
     auth::{AuthManager, create_totp, generate_totp_secret, hash_password},
-    config::{Config, default_config_path, load_or_create_seal_key, seal, seal_key_path, unseal},
+    config::{
+        Config, USER_PORT, default_config_path, load_or_create_seal_key, seal, seal_key_path,
+        unseal, user_config_path,
+    },
     server::{AppState, router},
 };
 use zeroize::{Zeroize, Zeroizing};
@@ -21,11 +24,12 @@ use zeroize::{Zeroize, Zeroizing};
 #[cfg(any(target_os = "macos", test))]
 mod launchd;
 mod update;
+mod user_service;
 #[cfg(windows)]
 mod windows_service_host;
 
 #[derive(Parser)]
-#[command(version = sudoserver::VERSION, about)]
+#[command(version = localshelld::VERSION, about)]
 struct Cli {
     #[command(subcommand)]
     command: CommandKind,
@@ -35,6 +39,9 @@ struct Cli {
 enum CommandKind {
     /// Initialize the Master Password and optional Authenticator support.
     Init {
+        /// Initialize an independent current-user daemon configuration.
+        #[arg(long)]
+        user: bool,
         #[arg(long)]
         config: Option<PathBuf>,
         #[arg(long)]
@@ -45,21 +52,30 @@ enum CommandKind {
         #[arg(long)]
         password_stdin: bool,
     },
-    /// Run the privileged HTTP/MCP server.
+    /// Run the system or current-user HTTP/MCP daemon.
     Serve {
+        /// Run as the current non-elevated user, routing sudo=true to the system daemon.
+        #[arg(long, conflicts_with = "allow_unelevated")]
+        user: bool,
         #[arg(long)]
         config: Option<PathBuf>,
         /// Development only: permit starting without administrator/root identity.
         #[arg(long)]
         allow_unelevated: bool,
     },
-    /// Register and start the native auto-start system service.
+    /// Register and start the system service or current-user autostart daemon.
     Install {
+        /// Install a login-started daemon for the current non-elevated user.
+        #[arg(long)]
+        user: bool,
         #[arg(long)]
         config: Option<PathBuf>,
     },
     /// Stop and unregister the native system service without deleting configuration.
-    Uninstall,
+    Uninstall {
+        #[arg(long)]
+        user: bool,
+    },
     /// Check for or install an update from the official GitHub Releases.
     Update(update::Options),
     /// Internal updater; only a prepared, local update plan is accepted.
@@ -80,22 +96,52 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "sudoserver=info".into()),
+                .unwrap_or_else(|_| "localshelld=info".into()),
         )
         .init();
     match Cli::parse().command {
         CommandKind::Init {
+            user,
             config,
             totp,
             force,
             password_stdin,
-        } => initialize(config_path(config)?, totp, force, password_stdin),
+        } => initialize(
+            mode_config_path(config, user)?,
+            totp,
+            force,
+            password_stdin,
+            user,
+        ),
         CommandKind::Serve {
+            user,
             config,
             allow_unelevated,
-        } => serve(config_path(config)?, allow_unelevated).await,
-        CommandKind::Install { config } => install(config_path(config)?),
-        CommandKind::Uninstall => uninstall(),
+        } => {
+            serve_mode_until(
+                mode_config_path(config, user)?,
+                allow_unelevated,
+                user,
+                shutdown_signal(),
+            )
+            .await
+        }
+        CommandKind::Install { config, user } => {
+            if user {
+                require_user()?;
+                user_service::install(&mode_config_path(config, true)?)
+            } else {
+                install(config_path(config)?)
+            }
+        }
+        CommandKind::Uninstall { user } => {
+            if user {
+                require_user()?;
+                user_service::uninstall()
+            } else {
+                uninstall()
+            }
+        }
         CommandKind::Update(options) => {
             tokio::task::spawn_blocking(move || update::run(options)).await?
         }
@@ -112,7 +158,24 @@ fn config_path(path: Option<PathBuf>) -> Result<PathBuf> {
     path.map_or_else(default_config_path, Ok)
 }
 
-fn initialize(path: PathBuf, enable_totp: bool, force: bool, password_stdin: bool) -> Result<()> {
+fn mode_config_path(path: Option<PathBuf>, user: bool) -> Result<PathBuf> {
+    if user {
+        path.map_or_else(user_config_path, Ok)
+    } else {
+        config_path(path)
+    }
+}
+
+fn initialize(
+    path: PathBuf,
+    enable_totp: bool,
+    force: bool,
+    password_stdin: bool,
+    user: bool,
+) -> Result<()> {
+    if user {
+        require_user()?;
+    }
     if path.exists() && !force {
         bail!(
             "{} already exists; use --force to replace it",
@@ -141,7 +204,10 @@ fn initialize(path: PathBuf, enable_totp: bool, force: bool, password_stdin: boo
     let key = load_or_create_seal_key(&key_path)?;
     let totp_secret = if enable_totp {
         let secret = generate_totp_secret();
-        let totp = create_totp(&secret)?;
+        let mut totp = create_totp(&secret)?;
+        if user {
+            totp.account_name = "local-user".into();
+        }
         println!("\nAdd this account to Proton Authenticator (or another RFC 6238 app):");
         println!("URI: {}", totp.get_url());
         println!("Manual secret: {}", totp.get_secret_base32());
@@ -157,28 +223,42 @@ fn initialize(path: PathBuf, enable_totp: bool, force: bool, password_stdin: boo
     } else {
         None
     };
-    Config {
+    let mut config = Config {
         password_hash,
         totp_secret,
         ..Config::default()
+    };
+    if user {
+        config.bind.set_port(USER_PORT);
     }
-    .save(&path)?;
+    config.save(&path)?;
     println!("Initialized {}", path.display());
     println!("No Master Password was stored; only its Argon2id verifier was written.");
     Ok(())
 }
 
-async fn serve(path: PathBuf, allow_unelevated: bool) -> Result<()> {
-    serve_until(path, allow_unelevated, shutdown_signal()).await
-}
-
+#[cfg(windows)]
 async fn serve_until<F>(path: PathBuf, allow_unelevated: bool, shutdown: F) -> Result<()>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    if !allow_unelevated && !is_elevated()? {
+    serve_mode_until(path, allow_unelevated, false, shutdown).await
+}
+
+async fn serve_mode_until<F>(
+    path: PathBuf,
+    allow_unelevated: bool,
+    user: bool,
+    shutdown: F,
+) -> Result<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    if user {
+        require_user()?;
+    } else if !allow_unelevated && !is_elevated()? {
         bail!(
-            "SudoServer must run as Administrator/root (or pass --allow-unelevated for development only)"
+            "localshelld must run as Administrator/root (or pass --allow-unelevated for development only)"
         );
     }
     let config = Config::load(&path)?;
@@ -192,8 +272,12 @@ where
     let auth = AuthManager::new(config.password_hash.clone(), totp_secret);
     tracing::info!(bind = %config.bind, "runtime token store initialized");
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
-    println!("SudoServer management UI: http://{}/", config.bind);
-    let state = AppState::new(config, auth);
+    println!("localshelld management UI: http://{}/", config.bind);
+    let state = if user {
+        AppState::user(config, auth)?
+    } else {
+        AppState::new(config, auth)
+    };
     axum::serve(listener, router(state.clone()))
         .with_graceful_shutdown(async move {
             shutdown.await;
@@ -223,19 +307,53 @@ async fn shutdown_signal() {
 fn is_elevated() -> Result<bool> {
     #[cfg(unix)]
     {
-        let output = Command::new("id")
+        let output = Command::new("/usr/bin/id")
             .arg("-u")
             .output()
             .context("failed to run id -u")?;
-        Ok(output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "0")
+        if !output.status.success() {
+            bail!("failed to inspect Unix process identity");
+        }
+        let uid: u32 = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse()
+            .context("invalid Unix process identity")?;
+        Ok(uid == 0)
     }
     #[cfg(windows)]
     {
-        Ok(Command::new("net")
-            .arg("session")
-            .output()
-            .is_ok_and(|output| output.status.success()))
+        // Unlike `net session`, this does not depend on the Server service being
+        // enabled. Failure to inspect the access token must never mean "user".
+        let output = windows_command("WindowsPowerShell/v1.0/powershell.exe")?
+            .args(["-NoProfile", "-NonInteractive", "-Command",
+                "([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)"])
+            .output().context("failed to inspect Windows process identity")?;
+        if !output.status.success() {
+            bail!("failed to inspect Windows process identity");
+        }
+        match String::from_utf8_lossy(&output.stdout).trim() {
+            "True" => Ok(true),
+            "False" => Ok(false),
+            _ => bail!("unexpected Windows process identity response"),
+        }
     }
+}
+
+fn require_user() -> Result<()> {
+    if is_elevated()? {
+        bail!(
+            "--user must run from a non-elevated user terminal; refusing root/Administrator identity"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_command(relative: &str) -> Result<Command> {
+    let root = std::env::var_os("SystemRoot").context("missing SystemRoot")?;
+    Ok(Command::new(
+        PathBuf::from(root).join("System32").join(relative),
+    ))
 }
 
 fn install(config_path: PathBuf) -> Result<()> {
@@ -253,7 +371,7 @@ fn install(config_path: PathBuf) -> Result<()> {
     install_windows_service(&executable, &config_path)?;
     #[cfg(target_os = "macos")]
     launchd::install(&executable, &config_path)?;
-    println!("SudoServer service installed and started.");
+    println!("localshelld service installed and started.");
     Ok(())
 }
 
@@ -269,9 +387,9 @@ fn uninstall() -> Result<()> {
     let removed = launchd::uninstall()?;
 
     if removed {
-        println!("SudoServer service stopped and uninstalled.");
+        println!("localshelld service stopped and uninstalled.");
     } else {
-        println!("SudoServer service is not installed.");
+        println!("localshelld service is not installed.");
     }
     println!("Configuration and seal.key were preserved.");
     Ok(())
@@ -280,17 +398,17 @@ fn uninstall() -> Result<()> {
 #[cfg(target_os = "linux")]
 fn install_systemd(executable: &Path, config: &Path) -> Result<()> {
     let unit = format!(
-        "[Unit]\nDescription=SudoServer privileged Bash broker\nAfter=network.target\n\n[Service]\nType=simple\nExecStart={} serve --config {}\nRestart=on-failure\nRestartSec=3\nNoNewPrivileges=false\n\n[Install]\nWantedBy=multi-user.target\n",
+        "[Unit]\nDescription=localshelld privileged Bash broker\nAfter=network.target\n\n[Service]\nType=simple\nExecStart={} serve --config {}\nRestart=on-failure\nRestartSec=3\nNoNewPrivileges=false\n\n[Install]\nWantedBy=multi-user.target\n",
         systemd_escape(executable),
         systemd_escape(config)
     );
     fs::write(SYSTEMD_UNIT_PATH, unit)?;
     checked(Command::new("systemctl").arg("daemon-reload"))?;
-    checked(Command::new("systemctl").args(["enable", "--now", "sudoserver.service"]))
+    checked(Command::new("systemctl").args(["enable", "--now", "localshelld.service"]))
 }
 
 #[cfg(target_os = "linux")]
-const SYSTEMD_UNIT_PATH: &str = "/etc/systemd/system/sudoserver.service";
+const SYSTEMD_UNIT_PATH: &str = "/etc/systemd/system/localshelld.service";
 
 #[cfg(target_os = "linux")]
 fn uninstall_systemd() -> Result<bool> {
@@ -298,7 +416,7 @@ fn uninstall_systemd() -> Result<bool> {
     if !unit_path.exists() {
         return Ok(false);
     }
-    checked(Command::new("systemctl").args(["disable", "--now", "sudoserver.service"]))?;
+    checked(Command::new("systemctl").args(["disable", "--now", "localshelld.service"]))?;
     fs::remove_file(unit_path)?;
     checked(Command::new("systemctl").arg("daemon-reload"))?;
     Ok(true)
@@ -318,28 +436,28 @@ fn install_windows_service(executable: &Path, config: &Path) -> Result<()> {
     );
     checked(Command::new("sc.exe").args([
         "create",
-        "SudoServer",
+        "localshelld",
         "binPath=",
         &bin_path,
         "start=",
         "auto",
         "DisplayName=",
-        "SudoServer",
+        "localshelld",
     ]))?;
     checked(Command::new("sc.exe").args([
         "description",
-        "SudoServer",
+        "localshelld",
         "User-controlled privileged PowerShell broker",
     ]))?;
     checked(Command::new("sc.exe").args([
         "failure",
-        "SudoServer",
+        "localshelld",
         "reset=",
         "86400",
         "actions=",
         "restart/5000/restart/15000/\"\"/0",
     ]))?;
-    checked(Command::new("sc.exe").args(["start", "SudoServer"]))
+    checked(Command::new("sc.exe").args(["start", "localshelld"]))
 }
 
 #[cfg(windows)]
@@ -358,14 +476,14 @@ fn uninstall_windows_service() -> Result<bool> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
         .context("failed to connect to the Windows Service Control Manager")?;
     let access = ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE;
-    let service = match manager.open_service("SudoServer", access) {
+    let service = match manager.open_service("localshelld", access) {
         Ok(service) => service,
         Err(windows_service::Error::Winapi(error))
             if error.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST) =>
         {
             return Ok(false);
         }
-        Err(error) => return Err(error).context("failed to open the SudoServer service"),
+        Err(error) => return Err(error).context("failed to open the localshelld service"),
     };
 
     match service.delete() {
@@ -373,7 +491,7 @@ fn uninstall_windows_service() -> Result<bool> {
         Err(windows_service::Error::Winapi(error))
             if error.raw_os_error() == Some(ERROR_SERVICE_MARKED_FOR_DELETE) => {}
         Err(error) => {
-            return Err(error).context("failed to mark the SudoServer service for deletion");
+            return Err(error).context("failed to mark the localshelld service for deletion");
         }
     }
 
@@ -382,7 +500,7 @@ fn uninstall_windows_service() -> Result<bool> {
     loop {
         let state = service
             .query_status()
-            .context("failed to query the SudoServer service status")?
+            .context("failed to query the localshelld service status")?
             .current_state;
         match state {
             ServiceState::Stopped => break,
@@ -395,7 +513,7 @@ fn uninstall_windows_service() -> Result<bool> {
                         stop_requested = true;
                     }
                     Err(error) => {
-                        return Err(error).context("failed to stop the SudoServer service");
+                        return Err(error).context("failed to stop the localshelld service");
                     }
                 }
             }
@@ -403,7 +521,7 @@ fn uninstall_windows_service() -> Result<bool> {
             _ => {}
         }
         if std::time::Instant::now() >= deadline {
-            bail!("SudoServer was marked for deletion but did not stop within 15 seconds");
+            bail!("localshelld was marked for deletion but did not stop within 15 seconds");
         }
         sleep(Duration::from_millis(200));
     }
@@ -430,17 +548,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn user_mode_has_separate_configuration_and_no_elevation_bypass() {
+        for command in ["init", "serve", "install", "uninstall"] {
+            assert!(Cli::try_parse_from(["localshelld", command, "--user"]).is_ok());
+        }
+        assert!(
+            Cli::try_parse_from(["localshelld", "serve", "--user", "--allow-unelevated"]).is_err()
+        );
+        assert_ne!(
+            mode_config_path(None, true).unwrap(),
+            mode_config_path(None, false).unwrap()
+        );
+    }
+
+    #[test]
     fn parses_uninstall_subcommand() {
-        let cli = Cli::try_parse_from(["sudoserver", "uninstall"]).unwrap();
-        assert!(matches!(cli.command, CommandKind::Uninstall));
+        let cli = Cli::try_parse_from(["localshelld", "uninstall"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            CommandKind::Uninstall { user: false }
+        ));
     }
 
     #[test]
     fn parses_update_options_and_rejects_ambiguous_downgrades() {
-        assert!(Cli::try_parse_from(["sudoserver", "update", "--check", "--prerelease"]).is_ok());
+        assert!(Cli::try_parse_from(["localshelld", "update", "--check", "--prerelease"]).is_ok());
         assert!(
             Cli::try_parse_from([
-                "sudoserver",
+                "localshelld",
                 "update",
                 "--tag",
                 "v0.1.0",
@@ -448,9 +583,9 @@ mod tests {
             ])
             .is_ok()
         );
-        assert!(Cli::try_parse_from(["sudoserver", "update", "--allow-downgrade"]).is_err());
+        assert!(Cli::try_parse_from(["localshelld", "update", "--allow-downgrade"]).is_err());
         assert!(
-            Cli::try_parse_from(["sudoserver", "update", "--tag", "v0.1.0", "--prerelease"])
+            Cli::try_parse_from(["localshelld", "update", "--tag", "v0.1.0", "--prerelease"])
                 .is_err()
         );
     }

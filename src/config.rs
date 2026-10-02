@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 pub const DEFAULT_PORT: u16 = 32119;
+pub const USER_PORT: u16 = 32120;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -24,6 +25,8 @@ pub struct Config {
     pub totp_secret: Option<SealedSecret>,
     pub shell: String,
     pub max_output_bytes: usize,
+    /// Only the user daemon connects to this privileged loopback endpoint.
+    pub privileged_daemon: SocketAddr,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -40,6 +43,10 @@ impl Default for Config {
             totp_secret: None,
             shell: crate::shell::ShellKind::native().executable().to_owned(),
             max_output_bytes: 8 * 1024 * 1024,
+            privileged_daemon: SocketAddr::new(
+                IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                DEFAULT_PORT,
+            ),
         }
     }
 }
@@ -67,6 +74,9 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if !self.privileged_daemon.ip().is_loopback() {
+            bail!("privileged_daemon must be a loopback address");
+        }
         if !self.bind.ip().is_loopback() {
             bail!(
                 "refusing non-loopback bind address {}; put a TLS/authenticating reverse proxy in front instead",
@@ -74,7 +84,7 @@ impl Config {
             );
         }
         if self.password_hash.is_empty() {
-            bail!("Master Password is not initialized; run `sudoserver init`");
+            bail!("Master Password is not initialized; run `localshelld init`");
         }
         if self.max_output_bytes < 1024 {
             bail!("max_output_bytes must be at least 1024");
@@ -110,8 +120,14 @@ impl Config {
 }
 
 pub fn default_config_path() -> Result<PathBuf> {
-    let dirs = ProjectDirs::from("dev", "SudoServer", "SudoServer")
+    let dirs = ProjectDirs::from("dev", "localshelld", "localshelld")
         .context("unable to determine the platform configuration directory")?;
+    Ok(dirs.config_dir().join("config.toml"))
+}
+
+pub fn user_config_path() -> Result<PathBuf> {
+    let dirs = ProjectDirs::from("dev", "localshelld", "localshelld-user")
+        .context("unable to determine the user configuration directory")?;
     Ok(dirs.config_dir().join("config.toml"))
 }
 
@@ -264,6 +280,16 @@ mod tests {
         let config = Config {
             password_hash: "hash".into(),
             bind: "0.0.0.0:1234".parse().unwrap(),
+            ..Config::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_remote_privileged_daemon() {
+        let config = Config {
+            password_hash: "hash".into(),
+            privileged_daemon: "192.0.2.1:32119".parse().unwrap(),
             ..Config::default()
         };
         assert!(config.validate().is_err());

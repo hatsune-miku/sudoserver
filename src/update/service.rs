@@ -28,11 +28,11 @@ impl Installed {
             .context("registered service binary is missing")?;
         ensure!(
             executable == target,
-            "SudoServer is registered at {}; run that binary's update command instead",
+            "localshelld is registered at {}; run that binary's update command instead",
             executable.display()
         );
         let config = config.canonicalize()?;
-        sudoserver::config::Config::load(&config)?;
+        localshelld::config::Config::load(&config)?;
         Ok(Self {
             executable,
             config,
@@ -48,7 +48,7 @@ impl Lifecycle for Installed {
 
     fn start_and_verify(&self, expected: Option<&str>) -> Result<()> {
         start()?;
-        let config = sudoserver::config::Config::load(&self.config)?;
+        let config = localshelld::config::Config::load(&self.config)?;
         // The loopback health check must not follow redirects or use an HTTP proxy.
         let client = reqwest::blocking::Client::builder()
             .no_proxy()
@@ -67,7 +67,7 @@ impl Lifecycle for Installed {
                 .and_then(|response| super::read_bounded(response, 4096).ok())
                 .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
             let valid = health.is_some_and(|health| {
-                health["service"] == "SudoServer"
+                health["service"] == "localshelld"
                     && health["status"] == "ok"
                     && expected.is_none_or(|version| health["version"] == version)
             });
@@ -142,7 +142,7 @@ pub(super) fn validate_target(target: &Path) -> Result<()> {
         // Fixed script; paths are data in the environment, never interpolated code.
         const SCRIPT: &str = r#"
 $ErrorActionPreference = 'Stop'
-$p = $env:SUDOSERVER_UPDATE_TARGET
+$p = $env:LOCALSHELLD_UPDATE_TARGET
 $depth = 0
 $trusted = @('S-1-5-18', 'S-1-5-32-544', 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
 while ($p) {
@@ -192,7 +192,7 @@ foreach ($sid in @('S-1-5-18', 'S-1-5-32-544')) {
   $rule = [Security.AccessControl.FileSystemAccessRule]::new($id, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
   $acl.AddAccessRule($rule)
 }
-[IO.Directory]::SetAccessControl($env:SUDOSERVER_UPDATE_TARGET, $acl)
+[IO.Directory]::SetAccessControl($env:LOCALSHELLD_UPDATE_TARGET, $acl)
 "#,
             path,
         )?;
@@ -226,7 +226,7 @@ fn powershell(script: &str, path: &Path) -> Result<()> {
                 "-EncodedCommand",
                 &encoded,
             ])
-            .env("SUDOSERVER_UPDATE_TARGET", path),
+            .env("LOCALSHELLD_UPDATE_TARGET", path),
     )?;
     Ok(())
 }
@@ -240,7 +240,7 @@ fn open_service(
         service_manager::{ServiceManager, ServiceManagerAccess},
     };
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
-    match manager.open_service("SudoServer", access) {
+    match manager.open_service("localshelld", access) {
         Ok(service) => Ok(Some(service)),
         Err(Error::Winapi(error)) if error.raw_os_error() == Some(1060) => Ok(None),
         Err(error) => Err(error.into()),
@@ -329,7 +329,7 @@ fn start() -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-const UNIT: &str = "/etc/systemd/system/sudoserver.service";
+const UNIT: &str = "/etc/systemd/system/localshelld.service";
 
 #[cfg(target_os = "linux")]
 pub(super) fn discover(target: &Path) -> Result<Option<Installed>> {
@@ -338,7 +338,7 @@ pub(super) fn discover(target: &Path) -> Result<Option<Installed>> {
     }
     let load = systemctl(&[
         "show",
-        "sudoserver.service",
+        "localshelld.service",
         "--property=LoadState",
         "--value",
     ])?;
@@ -351,13 +351,13 @@ pub(super) fn discover(target: &Path) -> Result<Option<Installed>> {
     );
     let fragment = systemctl(&[
         "show",
-        "sudoserver.service",
+        "localshelld.service",
         "--property=FragmentPath",
         "--value",
     ])?;
     let stale = systemctl(&[
         "show",
-        "sudoserver.service",
+        "localshelld.service",
         "--property=NeedDaemonReload",
         "--value",
     ])?;
@@ -367,7 +367,7 @@ pub(super) fn discover(target: &Path) -> Result<Option<Installed>> {
     );
     let overrides = systemctl(&[
         "show",
-        "sudoserver.service",
+        "localshelld.service",
         "--property=DropInPaths",
         "--value",
     ])?;
@@ -379,7 +379,7 @@ pub(super) fn discover(target: &Path) -> Result<Option<Installed>> {
     let (binary, config) = parse_systemd_registration(&text)?;
     let state = systemctl(&[
         "show",
-        "sudoserver.service",
+        "localshelld.service",
         "--property=ActiveState",
         "--value",
     ])?;
@@ -425,7 +425,7 @@ fn systemctl(args: &[&str]) -> Result<String> {
 fn running() -> Result<bool> {
     Ok(systemctl(&[
         "show",
-        "sudoserver.service",
+        "localshelld.service",
         "--property=ActiveState",
         "--value",
     ])?
@@ -435,12 +435,12 @@ fn running() -> Result<bool> {
 
 #[cfg(target_os = "linux")]
 fn stop() -> Result<()> {
-    systemctl(&["stop", "--no-block", "sudoserver.service"])?;
+    systemctl(&["stop", "--no-block", "localshelld.service"])?;
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let state = systemctl(&[
             "show",
-            "sudoserver.service",
+            "localshelld.service",
             "--property=ActiveState",
             "--value",
         ])?;
@@ -454,14 +454,14 @@ fn stop() -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn start() -> Result<()> {
-    systemctl(&["start", "--no-block", "sudoserver.service"])?;
+    systemctl(&["start", "--no-block", "localshelld.service"])?;
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
-const PLIST: &str = "/Library/LaunchDaemons/dev.sudoserver.plist";
+const PLIST: &str = "/Library/LaunchDaemons/dev.localshelld.plist";
 #[cfg(target_os = "macos")]
-const LABEL: &str = "system/dev.sudoserver";
+const LABEL: &str = "system/dev.localshelld";
 
 #[cfg(target_os = "macos")]
 fn launch_state() -> Result<Option<String>> {
@@ -547,15 +547,15 @@ mod tests {
 
     #[test]
     fn parses_managed_service_commands_without_shell_evaluation() {
-        assert_eq!(parse_windows_registration(r#""C:\Program Files\SudoServer\sudoserver.exe" service --config "C:\ProgramData\SudoServer\config.toml""#).unwrap(),
-            (r"C:\Program Files\SudoServer\sudoserver.exe", r"C:\ProgramData\SudoServer\config.toml"));
-        assert!(parse_windows_registration("sudoserver service").is_err());
-        assert_eq!(parse_systemd_registration("ExecStart=/opt/Sudo\\x20Server/sudoserver serve --config /etc/sudoserver/config.toml").unwrap(),
-            ("/opt/Sudo Server/sudoserver".into(), "/etc/sudoserver/config.toml".into()));
+        assert_eq!(parse_windows_registration(r#""C:\Program Files\localshelld\localshelld.exe" service --config "C:\ProgramData\localshelld\config.toml""#).unwrap(),
+            (r"C:\Program Files\localshelld\localshelld.exe", r"C:\ProgramData\localshelld\config.toml"));
+        assert!(parse_windows_registration("localshelld service").is_err());
+        assert_eq!(parse_systemd_registration("ExecStart=/opt/localshelld\\x20test/localshelld serve --config /etc/localshelld/config.toml").unwrap(),
+            ("/opt/localshelld test/localshelld".into(), "/etc/localshelld/config.toml".into()));
         assert!(parse_systemd_registration("ExecStart=/bin/sh -c evil").is_err());
         assert!(
             parse_systemd_registration(
-                "ExecStart=/opt/$USER/sudoserver serve --config /etc/config"
+                "ExecStart=/opt/$USER/localshelld serve --config /etc/config"
             )
             .is_err()
         );

@@ -1,6 +1,6 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rand_core::{OsRng, RngCore};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{fmt::Write as _, process::Stdio, time::Duration};
 use thiserror::Error;
 use tokio::{
@@ -38,7 +38,7 @@ impl ShellKind {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExecutionResult {
     pub output: String,
     pub exit_code: i32,
@@ -161,6 +161,9 @@ impl Shell {
     }
     pub async fn terminate(&self) {
         self.cancel();
+        self.wait_ended().await;
+    }
+    pub async fn wait_ended(&self) {
         let mut finished = self.finished.clone();
         let _ = finished.wait_for(|done| *done).await;
     }
@@ -221,7 +224,7 @@ impl Process {
         }
         let mut child = command
             // An updater must run outside the service's own process tree.
-            .env("SUDOSERVER_SESSION", "1")
+            .env("LOCALSHELLD_SESSION", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -442,7 +445,7 @@ mod tests {
         let native = ShellKind::native();
         let mut backends = vec![(native, native.executable().into())];
         if cfg!(windows)
-            && let Ok(path) = std::env::var("SUDOSERVER_TEST_BASH")
+            && let Ok(path) = std::env::var("LOCALSHELLD_TEST_BASH")
         {
             backends.push((ShellKind::Bash, path));
         }
@@ -471,8 +474,8 @@ mod tests {
                 &shell,
                 source(
                     kind,
-                    "$env:SUDOSERVER_SESSION",
-                    "printf '%s\\n' \"$SUDOSERVER_SESSION\"",
+                    "$env:LOCALSHELLD_SESSION",
+                    "printf '%s\\n' \"$LOCALSHELLD_SESSION\"",
                 ),
             )
             .await;
@@ -500,14 +503,14 @@ mod tests {
                 );
             }
             run(&shell, source(kind,
-                "$ss_test = 'persisted'; $env:SUDOSERVER_TEST = 'yes'; function ss_function { 'function-ok' }; Set-Location src",
-                "ss_test='persisted'; export SUDOSERVER_TEST=yes; ss_function() { printf 'function-ok\\n'; }; cd src")).await;
+                "$localshelld_test = 'persisted'; $env:LOCALSHELLD_TEST = 'yes'; function localshelld_function { 'function-ok' }; Set-Location src",
+                "localshelld_test='persisted'; export LOCALSHELLD_TEST=yes; localshelld_function() { printf 'function-ok\\n'; }; cd src")).await;
             let result = run(
                 &shell,
                 source(
                     kind,
-                    "\"$ss_test/$env:SUDOSERVER_TEST\"; ss_function; (Get-Location).Path",
-                    "printf '%s/%s\\n' \"$ss_test\" \"$SUDOSERVER_TEST\"; ss_function; pwd",
+                    "\"$localshelld_test/$env:LOCALSHELLD_TEST\"; localshelld_function; (Get-Location).Path",
+                    "printf '%s/%s\\n' \"$localshelld_test\" \"$LOCALSHELLD_TEST\"; localshelld_function; pwd",
                 ),
             )
             .await;
@@ -806,7 +809,7 @@ mod tests {
                 "--norc",
                 "-c",
                 "builtin eval -- \"$1\"",
-                "sudoserver-test",
+                "localshelld-test",
                 invalid,
             ])
             .env_remove("BASH_ENV")
@@ -829,10 +832,10 @@ mod tests {
         assert!(!result.session_ended);
         assert!(!result.output.starts_with("SHOULD_NOT_RUN"));
         // An invalid pipeline must not execute its left side or poison the next call.
-        let result = run(&shell, "ss_pipe_test=changed |").await;
+        let result = run(&shell, "localshelld_pipe_test=changed |").await;
         assert!(!result.success);
         assert_eq!(
-            run(&shell, "printf '%s' \"${ss_pipe_test-unset}\"")
+            run(&shell, "printf '%s' \"${localshelld_pipe_test-unset}\"")
                 .await
                 .output,
             "unset"

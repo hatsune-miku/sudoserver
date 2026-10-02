@@ -3,9 +3,12 @@
 **/*.rs.bk
 rust-project.json
 
-# SudoServer local runtime state and secrets
-/.sudoserver/
+# localshelld local runtime state and secrets
+/.localshelld/
 /config.toml
+/localshelld.local.toml
+# Keep legacy runtime secrets ignored during migration
+/.sudoserver/
 /sudoserver.local.toml
 **/seal.key
 *.jwt
@@ -46,7 +49,7 @@ tarpaulin-report.html
 Thumbs.db
 Desktop.ini
 
-# Keep Cargo.lock committed: SudoServer is an application, not a library.
+# Keep Cargo.lock committed: localshelld is an application, not a library.
 !Cargo.lock
 
 ARCH.md

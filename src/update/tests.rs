@@ -36,9 +36,9 @@ fn selects_by_semver_not_api_order_or_mislabelled_rc() {
 fn chooses_only_the_requested_platform_asset() {
     let mut release = release("v1.0.0", false, false);
     for name in [
-        "sudoserver-windows-x86_64.exe",
-        "sudoserver-windows-x86_64.zip",
-        "sudoserver-linux-x86_64.tar.gz",
+        "localshelld-windows-x86_64.exe",
+        "localshelld-windows-x86_64.zip",
+        "localshelld-linux-x86_64.tar.gz",
     ] {
         release.assets.push(Asset {
             name: name.into(),
@@ -48,7 +48,7 @@ fn chooses_only_the_requested_platform_asset() {
     }
     assert_eq!(
         asset_for(&release, "windows-x86_64").unwrap().1,
-        "sudoserver-windows-x86_64.zip"
+        "localshelld-windows-x86_64.zip"
     );
     assert!(asset_for(&release, "macos-aarch64").is_err());
 }
@@ -100,7 +100,7 @@ fn zip_extracts_only_exact_binary_not_path_traversal() {
     archive.start_file("../outside", options).unwrap();
     archive.write_all(b"bad").unwrap();
     archive
-        .start_file("SudoServer-windows-x86_64/sudoserver.exe", options)
+        .start_file("localshelld-windows-x86_64/localshelld.exe", options)
         .unwrap();
     archive.write_all(b"binary").unwrap();
     archive.finish().unwrap();
@@ -123,7 +123,7 @@ fn tar_rejects_symbolic_link_binary() {
     archive
         .append_link(
             &mut header,
-            "SudoServer-linux-x86_64/sudoserver",
+            "localshelld-linux-x86_64/localshelld",
             "/etc/passwd",
         )
         .unwrap();
@@ -163,7 +163,7 @@ impl Lifecycle for MockService {
 
 fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
     let temp = tempfile::tempdir().unwrap();
-    let target = temp.path().join("sudoserver");
+    let target = temp.path().join("localshelld");
     let stage = temp.path().join("stage");
     fs::create_dir(&stage).unwrap();
     fs::write(&target, b"old binary").unwrap();

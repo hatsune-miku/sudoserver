@@ -20,8 +20,8 @@ use sha2::{Digest, Sha256};
 #[cfg(windows)]
 use std::io::Write;
 
-const REPOSITORY: &str = "hatsune-miku/sudoserver";
-const API: &str = "https://api.github.com/repos/hatsune-miku/sudoserver";
+const REPOSITORY: &str = "hatsune-miku/localshelld";
+const API: &str = "https://api.github.com/repos/hatsune-miku/localshelld";
 const MAX_DOWNLOAD: u64 = 128 * 1024 * 1024;
 const MAX_JSON: u64 = 4 * 1024 * 1024;
 
@@ -86,7 +86,7 @@ fn select_release(releases: Vec<Release>, prerelease: bool) -> Result<Release> {
 
 fn client() -> Result<Client> {
     Ok(Client::builder()
-        .user_agent(concat!("SudoServer/", env!("SUDOSERVER_VERSION")))
+        .user_agent(concat!("localshelld/", env!("LOCALSHELLD_VERSION")))
         .https_only(true)
         .connect_timeout(Duration::from_secs(15))
         .timeout(Duration::from_secs(180))
@@ -171,9 +171,9 @@ fn asset_for(release: &Release, platform: &str) -> Result<(usize, String)> {
     } else {
         ".tar.gz"
     };
-    let archive = format!("sudoserver-{platform}{extension}");
+    let archive = format!("localshelld-{platform}{extension}");
     let raw = format!(
-        "sudoserver-{platform}{}",
+        "localshelld-{platform}{}",
         if platform.starts_with("windows-") {
             ".exe"
         } else {
@@ -282,11 +282,11 @@ fn copy_bounded(mut reader: impl Read, path: &Path) -> Result<()> {
 
 fn unpack(archive: &Path, name: &str, platform: &str, destination: &Path) -> Result<()> {
     let binary = if platform.starts_with("windows-") {
-        "sudoserver.exe"
+        "localshelld.exe"
     } else {
-        "sudoserver"
+        "localshelld"
     };
-    let expected = format!("SudoServer-{platform}/{binary}");
+    let expected = format!("localshelld-{platform}/{binary}");
     let mut found = false;
     // Never extract arbitrary archive paths, links, permissions, or ancillary files.
     if name.ends_with(".zip") {
@@ -391,7 +391,7 @@ fn probe(binary: &Path) -> Result<String> {
     let text = checked(Command::new(binary).arg("--version"))?;
     let value = text
         .trim()
-        .strip_prefix("sudoserver ")
+        .strip_prefix("localshelld ")
         .context("unexpected binary version response")?;
     version(value)?;
     Ok(value.to_owned())
@@ -421,19 +421,19 @@ fn lock(target: &Path) -> Result<File> {
 
 pub fn run(options: Options) -> Result<()> {
     ensure!(
-        options.check || std::env::var_os("SUDOSERVER_SESSION").is_none(),
-        "run updates from an independent Administrator/root terminal, not from a SudoServer session (--check is safe)"
+        options.check || std::env::var_os("LOCALSHELLD_SESSION").is_none(),
+        "updates run from an independent Administrator/root terminal; --check is also available inside a localshelld session"
     );
     let client = client()?;
     let release = find_release(&client, &options)?;
     let wanted = version(&release.tag_name)?;
-    let current = version(sudoserver::VERSION)?;
+    let current = version(localshelld::VERSION)?;
     let platform = platform()?;
     let (index, asset_name) = asset_for(&release, platform)?;
     println!(
         "Current: {} ({})\nSelected: {}\nAsset: {}",
-        sudoserver::VERSION,
-        sudoserver::COMMIT,
+        localshelld::VERSION,
+        localshelld::COMMIT,
         release.tag_name,
         asset_name
     );
@@ -461,7 +461,7 @@ pub fn run(options: Options) -> Result<()> {
     let _lock = lock(&target)?;
     let installed = service::discover(&target)?;
     let temp = tempfile::Builder::new()
-        .prefix(".sudoserver-update-")
+        .prefix(".localshelld-update-")
         .tempdir_in(target.parent().unwrap())?;
     service::protect_staging(temp.path())?;
     let archive = temp.path().join("download");
@@ -532,7 +532,7 @@ fn replace(source: &Path, target: &Path) -> Result<()> {
                     thread::sleep(Duration::from_millis(100))
                 }
                 Err(error) => return Err(error).context(
-                    "binary is in use or replacement failed; stop foreground SudoServer processes",
+                    "binary is in use or replacement failed; stop foreground localshelld processes",
                 ),
             }
         }

@@ -1,5 +1,7 @@
-# Security Policy
+# Personal Privacy and Issue Reporting
 
-SudoServer intentionally brokers unrestricted local administrator/root execution. Do not expose its HTTP port beyond loopback and do not include JWTs, handles, Master Passwords, TOTP values, configuration files, or `seal.key` in issue reports.
+localshelld is an open-source project for experienced device owners and maintainers to deploy and use personally. It helps the owner temporarily delegate their device's execution capabilities to an AI agent. The owner chooses the task, execution identity, authorization period and revocation.
 
-Report suspected vulnerabilities privately through the repository's GitHub Security Advisory page. Include a minimal reproduction with synthetic credentials. Never test against a machine or account you do not own or have explicit permission to administer.
+Respect the user's personal privacy.
+
+Reports can use synthetic credentials and sample data in place of personal files, command output or account information. The repository's GitHub Security Advisory page provides a private channel for reports that involve personal information or credentials.

@@ -44,8 +44,8 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
         "initialize" => Ok(json!({
             "protocolVersion": "2025-06-18",
             "capabilities": { "tools": { "listChanged": false } },
-            "serverInfo": { "name": "SudoServer", "version": crate::VERSION },
-            "instructions": server_instructions()
+            "serverInfo": { "name": "localshelld", "version": crate::VERSION },
+            "instructions": format!("{} Connected daemon: {:?}.", server_instructions(), state.mode)
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({ "tools": tool_definitions() })),
@@ -64,7 +64,7 @@ async fn call_tool(state: &AppState, params: Value) -> Result<Value, ApiError> {
         .cloned()
         .unwrap_or_else(|| json!({}));
     match name {
-        "sudo_enter" => {
+        "localshelld_enter" => {
             let token = string_arg(&arguments, "token")?;
             let confirm_text = string_arg(&arguments, "confirm_text")?;
             if confirm_text != "OK" {
@@ -79,23 +79,27 @@ async fn call_tool(state: &AppState, params: Value) -> Result<Value, ApiError> {
                     .map_err(|_| ApiError::internal(SERIALIZATION_FAILED))?,
             )
         }
-        "sudo_run" => {
+        "localshelld_run" => {
             let handle = string_arg(&arguments, "handle")?;
             let command = string_arg(&arguments, "command")?;
+            let sudo = arguments
+                .get("sudo")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| ApiError::bad_request("sudo must be an explicit boolean"))?;
             let timeout = timeout_arg(&arguments)?;
-            let result = state.run(handle, command, timeout).await?;
+            let result = state.run(handle, command, sudo, timeout).await?;
             tool_json(
                 serde_json::to_value(result)
                     .map_err(|_| ApiError::internal(SERIALIZATION_FAILED))?,
             )
         }
-        "sudo_destroy_session" => {
+        "localshelld_destroy_session" => {
             state
                 .destroy_session(string_arg(&arguments, "handle")?)
                 .await?;
             tool_json(json!({ "destroyed": true }))
         }
-        "sudo_revoke_token" => {
+        "localshelld_revoke_token" => {
             state.revoke_token(string_arg(&arguments, "token")?).await?;
             tool_json(json!({ "revoked": true }))
         }
@@ -134,20 +138,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exposes_all_required_tools_and_safety_language() {
+    fn exposes_all_required_tools_and_privacy_guidance() {
         let definitions = tool_definitions();
         let text = definitions.to_string();
         for tool in [
-            "sudo_enter",
-            "sudo_run",
-            "sudo_destroy_session",
-            "sudo_revoke_token",
+            "localshelld_enter",
+            "localshelld_run",
+            "localshelld_destroy_session",
+            "localshelld_revoke_token",
         ] {
             assert!(text.contains(tool));
         }
-        assert!(server_instructions().contains("arbitrary code execution"));
+        assert!(server_instructions().contains("user-authorized shell access"));
         assert!(server_instructions().contains(crate::shell::ShellKind::native().name()));
-        assert!(text.contains("With great power comes great responsibility"));
+        assert!(text.contains("Respect the user's personal privacy."));
         assert!(text.contains("reused"));
     }
 

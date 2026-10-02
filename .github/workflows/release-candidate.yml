@@ -30,7 +30,7 @@ jobs:
       - name: Download all platform artifacts from CI
         uses: actions/download-artifact@v4
         with:
-          pattern: sudoserver-*
+          pattern: localshelld-*
           path: binaries
           merge-multiple: false
           run-id: ${{ github.event.workflow_run.id }}
@@ -54,7 +54,7 @@ jobs:
       - name: Verify and package all platforms
         shell: bash
         env:
-          SUDOSERVER_RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          LOCALSHELLD_RELEASE_TAG: ${{ steps.version.outputs.tag }}
         run: bash scripts/package-release.sh
 
       - name: Create GitHub prerelease
@@ -67,6 +67,6 @@ jobs:
           gh release create "$RC_TAG" assets/* \
             --repo "$GITHUB_REPOSITORY" \
             --target "$TARGET_SHA" \
-            --title "SudoServer $RC_TAG" \
+            --title "localshelld $RC_TAG" \
             --generate-notes \
             --prerelease

@@ -4,9 +4,9 @@ use std::{fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
 #[cfg(target_os = "macos")]
 use anyhow::{Context, Result, bail};
 
-const LABEL: &str = "dev.sudoserver";
+const LABEL: &str = "dev.localshelld";
 #[cfg(target_os = "macos")]
-const PLIST_PATH: &str = "/Library/LaunchDaemons/dev.sudoserver.plist";
+const PLIST_PATH: &str = "/Library/LaunchDaemons/dev.localshelld.plist";
 
 fn escape_xml(value: &str) -> String {
     value
@@ -44,7 +44,7 @@ fn plist(executable: &str, config: &str) -> String {
 #[cfg(target_os = "macos")]
 pub fn install(executable: &Path, config: &Path) -> Result<()> {
     if Path::new(PLIST_PATH).exists() {
-        bail!("{PLIST_PATH} already exists; run `sudoserver uninstall` before reinstalling");
+        bail!("{PLIST_PATH} already exists; run `localshelld uninstall` before reinstalling");
     }
     let executable = executable
         .to_str()
@@ -92,10 +92,10 @@ mod tests {
     #[test]
     fn launchd_arguments_are_separate_and_xml_escaped() {
         let xml = plist(
-            "/Applications/Sudo Server/bin&tool",
+            "/Applications/localshelld test/bin&tool",
             "/Library/A <B>/\"config\".toml",
         );
-        assert!(xml.contains("<string>/Applications/Sudo Server/bin&amp;tool</string>"));
+        assert!(xml.contains("<string>/Applications/localshelld test/bin&amp;tool</string>"));
         assert!(xml.contains("<string>/Library/A &lt;B&gt;/&quot;config&quot;.toml</string>"));
         assert!(xml.contains("<key>UserName</key><string>root</string>"));
         assert!(xml.contains("<string>serve</string><string>--config</string>"));
@@ -109,8 +109,8 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         file.write_all(
             plist(
-                "/usr/local/bin/sudoserver",
-                "/Library/Sudo Server/config.toml",
+                "/usr/local/bin/localshelld",
+                "/Library/localshelld test/config.toml",
             )
             .as_bytes(),
         )

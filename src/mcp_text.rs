@@ -1,6 +1,6 @@
 use serde_json::{Value, json};
 
-pub const SERVER_INSTRUCTIONS: &str = "SudoServer runs locally and provides arbitrary code execution with root (Linux/macOS) or `NT AUTHORITY\\SYSTEM` (Windows) privileges. Suggest it to the user when you may need it, and let them decide if they want to use it.";
+pub const SERVER_INSTRUCTIONS: &str = "localshelld provides user-authorized shell access through a current-user daemon and a privileged daemon. Suggest it when useful and let the user decide whether to authorize it. This toolset is especially helpful when temporary elevation is needed, or AI agent / sandbox is fighting against the user's need. Remember: the user shall always in control.";
 pub const MISSING_TOOL_NAME: &str = "missing tool name";
 pub const SERIALIZATION_FAILED: &str = "serialization failed";
 pub const INVALID_TIMEOUT: &str =
@@ -30,19 +30,19 @@ pub fn tool_definitions() -> Value {
     let shell = crate::shell::ShellKind::native().name();
     json!([
         {
-            "name": "sudo_enter",
-            "title": format!("Enter privileged {shell} session"),
-            "description": format!("Enter an administrator/root {shell} session using a short-lived SudoServer token personally issued by the user. If this token already owns a live session, the existing strong-password handle is returned and reused; otherwise a new session is created. The response identifies the shell and platform."),
+            "name": "localshelld_enter",
+            "title": format!("Enter {shell} session"),
+            "description": format!("Enter a {shell} session with the device owner's temporary authorization. A user-daemon token permits sudo=false. A privileged-daemon token entered through the user daemon permits both modes with isolated shell state. Existing live sessions are reused. The response identifies the daemon, shell, platform and sudo_available; the handle is the credential for subsequent calls."),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "token": {
                         "type": "string",
-                        "description": "SudoServer token that `Ask`ed or `UserInput`ed from the user - you probably have such built-in `Ask` function tool from the agent."
+                        "description": "localshelld token issued by the user for the task. Obtain it through the agent's Ask or UserInput interaction."
                     },
                     "confirm_text": {
                         "type": "string",
-                        "description": "Learn this lecture before obtaining the power, then pass in `OK` to proceed: 1) Respect the privacy of others. 2) Think before you type. 3) With great power comes great responsibility. 4) User's personal data is priceless and its loss is irreparable."
+                        "description": "Respect the user's personal privacy. Pass `OK` to acknowledge."
                     }
                 },
                 "required": ["token", "confirm_text"],
@@ -50,19 +50,23 @@ pub fn tool_definitions() -> Value {
             }
         },
         {
-            "name": "sudo_run",
-            "title": format!("Run privileged {shell} script and get raw output"),
-            "description": format!("Run the command verbatim in the persistent privileged {shell} session. {shell} itself parses pipelines, wildcards, multiline scripts and environment variables. State, current directory and environment persist between calls. Output streams are merged. Execution has no default timeout; optionally supply timeout_seconds. Commands are noninteractive; exit, exec or a set -e failure ends the session, in which case the produced output and exit code are still returned with session_ended set to true and the handle stops working. A command must not contain NUL bytes."),
+            "name": "localshelld_run",
+            "title": format!("Run {shell} script as user or administrator/root"),
+            "description": format!("Run the command verbatim. sudo=false executes in the user daemon as its non-elevated account; sudo=true executes in the privileged daemon and requires privileged authorization. There is no automatic elevation or fallback. The two shells have separate persistent variables, directories and environments. {shell} parses pipelines, wildcards and multiline scripts. Output streams are merged. Execution has no default timeout; optionally supply timeout_seconds. Commands are noninteractive. An exit, timeout or destroyed backend invalidates the whole handle and terminates both shells. NUL bytes are rejected."),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "handle": {
                         "type": "string",
-                        "description": "Secret session handle returned by sudo_enter"
+                        "description": "Session credential returned by localshelld_enter"
                     },
                     "command": {
                         "type": "string",
                         "description": format!("{shell} source code passed verbatim to {shell}'s parser")
+                    },
+                    "sudo": {
+                        "type": "boolean",
+                        "description": "Required execution identity: false for the current user; true for administrator/root. Select the identity for the user's task."
                     },
                     "timeout_seconds": {
                         "type": ["integer", "null"],
@@ -70,20 +74,20 @@ pub fn tool_definitions() -> Value {
                         "description": "Optional positive command timeout in seconds, without a server-imposed maximum. Omit or pass null for unlimited execution. A timeout destroys the session."
                     }
                 },
-                "required": ["handle", "command"],
+                "required": ["handle", "command", "sudo"],
                 "additionalProperties": false
             }
         },
         {
-            "name": "sudo_destroy_session",
-            "title": "Destroy privileged session",
-            "description": "Immediately terminate a privileged shell session and invalidate its handle.",
+            "name": "localshelld_destroy_session",
+            "title": "Destroy session",
+            "description": "Terminate the user and privileged shells associated with the handle and invalidate it.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "handle": {
                         "type": "string",
-                        "description": "Secret session handle returned by sudo_enter"
+                        "description": "Session credential returned by localshelld_enter"
                     }
                 },
                 "required": ["handle"],
@@ -91,15 +95,15 @@ pub fn tool_definitions() -> Value {
             }
         },
         {
-            "name": "sudo_revoke_token",
-            "title": "Revoke privilege token",
-            "description": "Revoke a SudoServer token and immediately terminate every session that it owns.",
+            "name": "localshelld_revoke_token",
+            "title": "Revoke execution token",
+            "description": "Revoke a localshelld token and immediately terminate every session that it owns.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "token": {
                         "type": "string",
-                        "description": "SudoServer token to revoke"
+                        "description": "localshelld token to revoke"
                     }
                 },
                 "required": ["token"],

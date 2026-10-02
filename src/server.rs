@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use axum::{
     Json, Router,
@@ -15,12 +15,15 @@ use crate::{
     auth::{AuthError, AuthManager, Credential, DEFAULT_TOKEN_TTL_SECONDS, TokenRecord},
     config::Config,
     mcp,
+    peer::Peer,
     shell::{ExecutionResult, Shell, ShellError, ShellKind},
 };
 
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
+    pub mode: DaemonMode,
+    peer: Option<Peer>,
     auth: Arc<Mutex<AuthManager>>,
     sessions: Arc<Mutex<SessionStore>>,
 }
@@ -29,6 +32,14 @@ struct Session {
     token_id: String,
     expires_at: Option<i64>,
     shell: Arc<Shell>,
+    remote_handle: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DaemonMode {
+    User,
+    Privileged,
 }
 
 #[derive(Default)]
@@ -44,6 +55,9 @@ pub struct EnterResult {
     pub reused: bool,
     pub shell: ShellKind,
     pub platform: &'static str,
+    pub daemon: DaemonMode,
+    pub sudo_available: bool,
+    pub expires_at: Option<i64>,
     pub message: String,
 }
 
@@ -55,6 +69,26 @@ pub struct ApiError {
 }
 
 impl ApiError {
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: message.into(),
+        }
+    }
+
+    pub fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn peer(status: StatusCode) -> Self {
+        Self {
+            status,
+            message: format!("privileged daemon rejected the request ({status})"),
+        }
+    }
     pub fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
@@ -111,13 +145,33 @@ impl IntoResponse for ApiError {
 impl AppState {
     pub fn new(config: Config, auth: AuthManager) -> Self {
         Self {
+            mode: DaemonMode::Privileged,
+            peer: None,
             config: Arc::new(config),
             auth: Arc::new(Mutex::new(auth)),
             sessions: Arc::new(Mutex::new(SessionStore::default())),
         }
     }
 
+    pub fn user(config: Config, auth: AuthManager) -> Result<Self, ApiError> {
+        if config.bind == config.privileged_daemon {
+            return Err(ApiError::bad_request(
+                "user and privileged daemon addresses must differ",
+            ));
+        }
+        let peer = Peer::new(config.privileged_daemon, config.max_output_bytes)?;
+        let mut state = Self::new(config, auth);
+        state.mode = DaemonMode::User;
+        state.peer = Some(peer);
+        Ok(state)
+    }
+
     pub async fn enter(&self, token: &str) -> Result<EnterResult, ApiError> {
+        // Known local tokens (including expired/revoked ones) never fall back to
+        // a different authority. A user token cannot acquire privileged access.
+        if self.mode == DaemonMode::User && self.auth.lock().await.token_identity(token).is_err() {
+            return self.enter_remote(token).await;
+        }
         // Keep authorization and insertion atomic with respect to token revocation.
         let auth = self.auth.lock().await;
         let authorization = auth.verify_token(token)?;
@@ -136,7 +190,10 @@ impl AppState {
                     reused: true,
                     shell: ShellKind::native(),
                     platform: std::env::consts::OS,
-                    message: "Reused the token's existing privileged session.".into(),
+                    daemon: self.mode,
+                    sudo_available: self.mode == DaemonMode::Privileged,
+                    expires_at: authorization.expires_at,
+                    message: "Reused the token's existing session.".into(),
                 });
             }
             remove_session(&mut sessions, &handle);
@@ -152,6 +209,7 @@ impl AppState {
                 token_id: authorization.id,
                 expires_at: authorization.expires_at,
                 shell: Arc::new(shell),
+                remote_handle: None,
             },
         );
         Ok(EnterResult {
@@ -159,10 +217,84 @@ impl AppState {
             reused: false,
             shell: ShellKind::native(),
             platform: std::env::consts::OS,
+            daemon: self.mode,
+            sudo_available: self.mode == DaemonMode::Privileged,
+            expires_at: authorization.expires_at,
             message: format!(
-                "Created a new privileged {} session. Treat the handle as a password.",
+                "Created a new {} session. Use the handle for subsequent calls.",
                 ShellKind::native().name()
             ),
+        })
+    }
+
+    async fn enter_remote(&self, token: &str) -> Result<EnterResult, ApiError> {
+        let peer = self.peer.as_ref().expect("user daemon has a peer");
+        let entered = peer.enter(token).await?;
+        let key = format!("privileged:{}", entered.handle);
+        let mut sessions = self.sessions.lock().await;
+        if sessions.shutting_down {
+            drop(sessions);
+            let _ = peer.destroy(&entered.handle).await;
+            return Err(ApiError::internal("server is shutting down"));
+        }
+        let existing = sessions.by_token.get(&key).cloned();
+        if existing.as_ref().is_some_and(|handle| {
+            sessions
+                .by_handle
+                .get(handle)
+                .is_none_or(|session| session.shell.is_finished())
+        }) {
+            return Err(ApiError::unavailable(
+                "previous session is closing; enter again after it closes",
+            ));
+        }
+        let reused = existing.is_some();
+        let handle = if let Some(handle) = existing {
+            handle
+        } else {
+            let shell = match Shell::spawn(&self.config.shell, self.config.max_output_bytes).await {
+                Ok(shell) => Arc::new(shell),
+                Err(error) => {
+                    drop(sessions);
+                    let _ = peer.destroy(&entered.handle).await;
+                    return Err(error.into());
+                }
+            };
+            let handle = strong_handle();
+            sessions.by_token.insert(key.clone(), handle.clone());
+            sessions.by_handle.insert(
+                handle.clone(),
+                Session {
+                    token_id: key,
+                    expires_at: entered.expires_at,
+                    shell: Arc::clone(&shell),
+                    remote_handle: Some(entered.handle.clone()),
+                },
+            );
+            // A bounded long poll propagates revocation, shutdown and loss of the
+            // privileged authority to the user shell, including running commands.
+            let state = self.clone();
+            let watched_handle = handle.clone();
+            let remote = entered.handle;
+            let peer = peer.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = shell.wait_ended() => break,
+                        result = peer.validate(&remote, true) => if result.is_err() { break; },
+                    }
+                }
+                remove_session(&mut *state.sessions.lock().await, &watched_handle);
+                shell.terminate().await;
+                let _ = peer.destroy(&remote).await;
+            });
+            handle
+        };
+        Ok(EnterResult {
+            handle, reused, shell: ShellKind::native(), platform: std::env::consts::OS,
+            daemon: self.mode, sudo_available: true, expires_at: entered.expires_at,
+            message: "User and privileged shells have separate state. Set sudo explicitly for every command.".into(),
         })
     }
 
@@ -170,6 +302,7 @@ impl AppState {
         &self,
         handle: &str,
         command: &str,
+        sudo: bool,
         requested_timeout: Option<u64>,
     ) -> Result<ExecutionResult, ApiError> {
         if requested_timeout == Some(0) {
@@ -177,7 +310,12 @@ impl AppState {
                 "timeout_seconds must be greater than zero",
             ));
         }
-        let shell = {
+        if self.mode == DaemonMode::Privileged && !sudo {
+            return Err(ApiError::forbidden(
+                "sudo=false requires the user daemon; connect to its MCP endpoint",
+            ));
+        }
+        let (shell, remote) = {
             let mut sessions = self.sessions.lock().await;
             let expired = sessions
                 .by_handle
@@ -191,9 +329,30 @@ impl AppState {
             sessions
                 .by_handle
                 .get(handle)
-                .map(|session| Arc::clone(&session.shell))
+                .map(|session| (Arc::clone(&session.shell), session.remote_handle.clone()))
                 .ok_or_else(|| ApiError::from(AuthError::InvalidCredential))?
         };
+        if let Some(remote) = &remote {
+            let peer = self.peer.as_ref().expect("remote session has a peer");
+            if sudo {
+                let result = peer.run(remote, command, requested_timeout).await;
+                if result.as_ref().map_or_else(
+                    |error| error.status != StatusCode::BAD_REQUEST,
+                    |result| result.session_ended,
+                ) {
+                    let _ = self.destroy_session(handle).await;
+                }
+                return result;
+            }
+            if let Err(error) = peer.validate(remote, false).await {
+                let _ = self.destroy_session(handle).await;
+                return Err(error);
+            }
+        } else if sudo && self.mode == DaemonMode::User {
+            return Err(ApiError::forbidden(
+                "this user token does not authorize sudo=true; enter with a user-issued privileged daemon token",
+            ));
+        }
         let result = shell.execute(command, requested_timeout).await;
         // A rejected command leaves the session healthy; any other error, or a
         // command that ended the shell, invalidates the handle.
@@ -210,16 +369,34 @@ impl AppState {
     }
 
     pub async fn destroy_session(&self, handle: &str) -> Result<(), ApiError> {
-        let shell = {
+        let (shell, remote) = {
             let mut sessions = self.sessions.lock().await;
-            remove_session(&mut sessions, handle)
-                .ok_or_else(|| ApiError::from(AuthError::InvalidCredential))?
+            let remote = sessions
+                .by_handle
+                .get(handle)
+                .and_then(|s| s.remote_handle.clone());
+            let shell = remove_session(&mut sessions, handle)
+                .ok_or_else(|| ApiError::from(AuthError::InvalidCredential))?;
+            (shell, remote)
         };
         shell.terminate().await;
+        if let (Some(peer), Some(remote)) = (&self.peer, remote) {
+            // Removal is idempotent: the monitor may already have closed it.
+            if let Err(error) = peer.destroy(&remote).await
+                && error.status != StatusCode::UNAUTHORIZED
+            {
+                return Err(error);
+            }
+        }
         Ok(())
     }
 
     pub async fn revoke_token(&self, token: &str) -> Result<(), ApiError> {
+        if let Some(peer) = &self.peer
+            && self.auth.lock().await.token_identity(token).is_err()
+        {
+            return peer.revoke(token).await;
+        }
         let token_id = {
             let mut auth = self.auth.lock().await;
             let authorization = auth.token_identity(token)?;
@@ -250,7 +427,7 @@ impl AppState {
     }
 
     pub async fn shutdown(&self) {
-        let shells = {
+        let sessions = {
             let mut sessions = self.sessions.lock().await;
             sessions.shutting_down = true;
             sessions.by_token.clear();
@@ -259,13 +436,49 @@ impl AppState {
                 .drain()
                 .map(|(_, session)| {
                     session.shell.cancel();
-                    session.shell
+                    session
                 })
                 .collect::<Vec<_>>()
         };
-        for shell in shells {
-            shell.terminate().await;
+        for session in sessions {
+            session.shell.terminate().await;
+            if let (Some(peer), Some(remote)) = (&self.peer, session.remote_handle) {
+                let _ = peer.destroy(&remote).await;
+            }
         }
+    }
+
+    async fn validate_session(&self, handle: &str, watch: bool) -> Result<(), ApiError> {
+        if self.mode != DaemonMode::Privileged {
+            return Err(ApiError::forbidden(
+                "session validation is only served by the privileged daemon",
+            ));
+        }
+        let (shell, expires) = {
+            let sessions = self.sessions.lock().await;
+            let session = sessions
+                .by_handle
+                .get(handle)
+                .ok_or(AuthError::InvalidCredential)?;
+            (Arc::clone(&session.shell), session.expires_at)
+        };
+        let remaining = expires.map(|expiry| expiry.saturating_sub(Utc::now().timestamp()));
+        if remaining.is_some_and(|seconds| seconds <= 0) || shell.is_finished() {
+            let _ = self.destroy_session(handle).await;
+            return Err(AuthError::Expired.into());
+        }
+        if watch {
+            let wait = remaining.unwrap_or(15).min(15) as u64;
+            tokio::select! {
+                _ = shell.wait_ended() => return Err(AuthError::InvalidCredential.into()),
+                _ = tokio::time::sleep(Duration::from_secs(wait)) => {},
+            }
+            if expires.is_some_and(|expiry| expiry <= Utc::now().timestamp()) {
+                let _ = self.destroy_session(handle).await;
+                return Err(AuthError::Expired.into());
+            }
+        }
+        Ok(())
     }
 
     async fn authenticate(&self, credential: &Credential) -> Result<(), ApiError> {
@@ -276,10 +489,19 @@ impl AppState {
 
 fn remove_session(store: &mut SessionStore, handle: &str) -> Option<Arc<Shell>> {
     let session = store.by_handle.remove(handle)?;
-    store.by_token.remove(&session.token_id);
+    if store
+        .by_token
+        .get(&session.token_id)
+        .is_some_and(|mapped| mapped == handle)
+    {
+        store.by_token.remove(&session.token_id);
+    }
     session.shell.cancel();
     Some(session.shell)
 }
+
+#[cfg(test)]
+mod dual_daemon_tests;
 
 fn strong_handle() -> String {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -297,6 +519,7 @@ struct TokenBody {
 struct RunBody {
     handle: String,
     command: String,
+    sudo: bool,
     timeout_seconds: Option<u64>,
 }
 
@@ -338,6 +561,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/sessions/enter", post(enter))
         .route("/v1/commands/run", post(run))
         .route("/v1/sessions/destroy", post(destroy))
+        .route("/v1/sessions/validate", post(validate))
+        .route("/v1/sessions/watch", post(watch))
         .route("/v1/tokens/revoke", post(revoke))
         .route("/v1/admin/tokens/issue", post(issue))
         .route("/v1/admin/tokens/list", post(list_tokens))
@@ -346,13 +571,21 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn index() -> Html<&'static str> {
-    Html(include_str!("ui.html"))
+async fn index(axum::extract::State(state): axum::extract::State<AppState>) -> Html<String> {
+    let text = include_str!("ui.html");
+    let scope = if state.mode == DaemonMode::User {
+        "当前用户权限（不含管理员/root）"
+    } else {
+        "管理员/root 权限"
+    };
+    Html(text.replace("{{AUTHORIZATION_SCOPE}}", scope))
 }
 
-async fn health() -> Json<serde_json::Value> {
+async fn health(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> Json<serde_json::Value> {
     Json(
-        serde_json::json!({ "status": "ok", "service": "SudoServer", "version": crate::VERSION, "commit": crate::COMMIT }),
+        serde_json::json!({ "status": "ok", "service": "localshelld", "daemon": state.mode, "version": crate::VERSION, "commit": crate::COMMIT }),
     )
 }
 
@@ -369,9 +602,25 @@ async fn run(
 ) -> Result<Json<ExecutionResult>, ApiError> {
     Ok(Json(
         state
-            .run(&body.handle, &body.command, body.timeout_seconds)
+            .run(&body.handle, &body.command, body.sudo, body.timeout_seconds)
             .await?,
     ))
+}
+
+async fn validate(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    Json(body): Json<HandleBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state.validate_session(&body.handle, false).await?;
+    Ok(Json(serde_json::json!({"valid": true})))
+}
+
+async fn watch(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    Json(body): Json<HandleBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state.validate_session(&body.handle, true).await?;
+    Ok(Json(serde_json::json!({"valid": true})))
 }
 
 async fn destroy(
@@ -409,7 +658,11 @@ async fn issue(
     Ok(Json(IssueResponse {
         token,
         record,
-        warning: "This token grants full administrator/root command execution. It naturally becomes invalid when SudoServer restarts.",
+        warning: if state.mode == DaemonMode::User {
+            "User-authorized current-user execution (sudo=false). Valid until expiry, revocation or user daemon restart."
+        } else {
+            "User-authorized administrator/root execution. Valid until expiry, revocation or privileged daemon restart."
+        },
     }))
 }
 
@@ -445,7 +698,7 @@ mod tests {
     use super::*;
     use crate::auth::hash_password;
 
-    async fn request(app: &Router, path: &str, body: Value) -> (StatusCode, Value) {
+    pub(super) async fn request(app: &Router, path: &str, body: Value) -> (StatusCode, Value) {
         let response = app
             .clone()
             .oneshot(
@@ -461,7 +714,8 @@ mod tests {
         let body = if bytes.is_empty() {
             Value::Null
         } else {
-            serde_json::from_slice(&bytes).unwrap()
+            serde_json::from_slice(&bytes)
+                .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()))
         };
         (status, body)
     }
@@ -519,7 +773,7 @@ mod tests {
         let (status, result) = request(
             &app,
             "/v1/commands/run",
-            json!({ "handle": handle, "command": if cfg!(windows) { "$global:httpState=40+2; $global:httpState" } else { "httpState=$((40+2)); echo $httpState" } }),
+            json!({ "handle": handle, "sudo": true, "command": if cfg!(windows) { "$global:httpState=40+2; $global:httpState" } else { "httpState=$((40+2)); echo $httpState" } }),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -530,7 +784,7 @@ mod tests {
         let (status, _) = request(
             &app,
             "/v1/commands/run",
-            json!({ "handle": handle, "command": "'should not run'" }),
+            json!({ "handle": handle, "sudo": true, "command": "'should not run'" }),
         )
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -597,12 +851,12 @@ mod tests {
             let state = AppState::new(config, auth);
             let entered = state.enter(&token).await.unwrap();
             state
-                .run(&entered.handle, "echo ready", Some(3600))
+                .run(&entered.handle, "echo ready", true, Some(3600))
                 .await
                 .unwrap();
             assert!(
                 state
-                    .run(&entered.handle, "echo invalid", Some(0))
+                    .run(&entered.handle, "echo invalid", true, Some(0))
                     .await
                     .is_err()
             );
@@ -618,6 +872,7 @@ mod tests {
                             } else {
                                 "while :; do :; done"
                             },
+                            true,
                             None,
                         )
                         .await
@@ -636,7 +891,7 @@ mod tests {
             assert!(executing.await.unwrap().is_err());
             assert!(
                 state
-                    .run(&entered.handle, "echo never", None)
+                    .run(&entered.handle, "echo never", true, None)
                     .await
                     .is_err()
             );

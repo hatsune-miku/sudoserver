@@ -1,8 +1,8 @@
 [package]
-name = "sudoserver"
+name = "localshelld"
 version = "0.1.0"
 edition = "2024"
-description = "User-controlled privileged PowerShell and Bash sessions over HTTP and MCP"
+description = "User-controlled local and privileged PowerShell and Bash sessions over HTTP and MCP"
 license = "MIT"
 
 [dependencies]
