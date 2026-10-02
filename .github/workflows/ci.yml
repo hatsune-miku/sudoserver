@@ -55,7 +55,9 @@ jobs:
       - run: cargo build --release
       - name: Verify real user and root daemon identities
         if: runner.os != 'Windows'
-        run: python3 scripts/test-dual-daemon.py target/release/localshelld
+        run: |
+          python3 -m unittest discover -s scripts -p 'test_*.py' -v
+          python3 scripts/test-dual-daemon.py target/release/localshelld
       - name: Verify embedded version
         if: env.LOCALSHELLD_RELEASE_TAG != ''
         shell: bash

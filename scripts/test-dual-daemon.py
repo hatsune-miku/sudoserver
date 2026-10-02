@@ -6,6 +6,7 @@ Requires an ordinary account with passwordless sudo. Does not install services.
 import json
 import os
 from pathlib import Path
+import signal
 import socket
 import subprocess
 import sys
@@ -37,6 +38,45 @@ def wait_ready(base, process):
         except (OSError, urllib.error.URLError):
             time.sleep(0.1)
     raise RuntimeError("daemon did not become ready")
+
+
+def signal_group(process, elevated, sig):
+    # start_new_session=True makes this child's PID its process group ID.
+    # Use killpg directly: negative PIDs can be parsed as options by /bin/kill.
+    if elevated:
+        subprocess.run(
+            ["sudo", "-n", "--", sys.executable, "-c",
+             "import os, sys\n"
+             "try: os.killpg(int(sys.argv[1]), int(sys.argv[2]))\n"
+             "except ProcessLookupError: pass\n",
+             str(process.pid), str(int(sig))],
+            check=True, timeout=5,
+        )
+    else:
+        try:
+            os.killpg(process.pid, sig)
+        except ProcessLookupError:
+            pass  # The process group exited between poll() and killpg().
+
+
+def stop_processes(processes):
+    errors = []
+    for process, elevated in reversed(processes):
+        if process.poll() is not None:
+            continue
+        try:
+            try:
+                signal_group(process, elevated, signal.SIGTERM)
+                process.wait(timeout=10)
+            except (OSError, subprocess.SubprocessError) as error:
+                print(f"Daemon {process.pid} did not stop after SIGTERM ({error}); sending SIGKILL.",
+                      file=sys.stderr)
+                signal_group(process, elevated, signal.SIGKILL)
+                process.wait(timeout=5)
+        except (OSError, subprocess.SubprocessError) as error:
+            errors.append(f"daemon {process.pid}: {error}")
+    if errors:
+        raise RuntimeError("Failed to clean up " + "; ".join(errors))
 
 
 def main():
@@ -94,15 +134,7 @@ def main():
             assert rejected.returncode != 0 and "non-elevated" in rejected.stderr
             print("Dual daemon identities verified: sudo=false is current user; sudo=true is root.")
         finally:
-            for process, elevated in reversed(processes):
-                if process.poll() is None:
-                    prefix = ["sudo", "-n"] if elevated else []
-                    subprocess.run([*prefix, "/bin/kill", "-TERM", f"-{process.pid}"], check=False)
-                    try:
-                        process.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        subprocess.run([*prefix, "/bin/kill", "-KILL", f"-{process.pid}"], check=False)
-                        process.wait(timeout=5)
+            stop_processes(processes)
 
 
 if __name__ == "__main__":
